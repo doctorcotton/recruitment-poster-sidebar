@@ -1,0 +1,9 @@
+.source-poster-web/
+.venv-baseline/
+.codebase-memory/
+artifacts/
+assets/
+tests/
+scripts/
+.env.local
+docs/

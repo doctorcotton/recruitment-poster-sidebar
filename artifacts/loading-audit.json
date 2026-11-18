@@ -1,0 +1,91 @@
+{
+  "runtime": "本地生产构建，Chromium，独立冷缓存上下文，点击查看记录至字段/海报出现（毫秒）",
+  "limited": {
+    "downloadBytesPerSecond": 1048576,
+    "latencyMs": 35
+  },
+  "observations": [
+    {
+      "limited": false,
+      "samples": {
+        "before": [
+          {
+            "fields": 51,
+            "poster": 109
+          },
+          {
+            "fields": 49,
+            "poster": 105
+          },
+          {
+            "fields": 47,
+            "poster": 106
+          },
+          {
+            "fields": 52,
+            "poster": 110
+          },
+          {
+            "fields": 50,
+            "poster": 107
+          }
+        ],
+        "after": [
+          {
+            "fields": 49,
+            "poster": 157
+          },
+          {
+            "fields": 48,
+            "poster": 154
+          },
+          {
+            "fields": 53,
+            "poster": 165
+          },
+          {
+            "fields": 48,
+            "poster": 157
+          },
+          {
+            "fields": 47,
+            "poster": 155
+          }
+        ]
+      }
+    },
+    {
+      "limited": true,
+      "samples": {
+        "before": [
+          {
+            "fields": 9964,
+            "poster": 10020
+          },
+          {
+            "fields": 9954,
+            "poster": 10014
+          },
+          {
+            "fields": 10014,
+            "poster": 10088
+          }
+        ],
+        "after": [
+          {
+            "fields": 55,
+            "poster": 8023
+          },
+          {
+            "fields": 48,
+            "poster": 8010
+          },
+          {
+            "fields": 50,
+            "poster": 8048
+          }
+        ]
+      }
+    }
+  ]
+}

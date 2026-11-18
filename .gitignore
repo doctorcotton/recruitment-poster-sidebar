@@ -1,0 +1,12 @@
+node_modules/
+.env
+.env.local
+.venv-baseline/
+.source-poster-web/
+.vercel/
+.codebase-memory/
+artifacts/*
+!artifacts/loading-audit.json
+dist/
+output/
+.zcode/

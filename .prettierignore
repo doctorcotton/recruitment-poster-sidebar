@@ -1,0 +1,8 @@
+dist
+node_modules
+artifacts
+assets
+.source-poster-web
+.venv-baseline
+output
+package-lock.json
