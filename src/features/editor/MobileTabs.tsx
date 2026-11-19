@@ -1,7 +1,7 @@
 const TABS = [
-  { id: "layers", label: "模板" },
+  { id: "templates", label: "模板" },
   { id: "canvas", label: "画布" },
-  { id: "properties", label: "文字属性" },
+  { id: "properties", label: "属性" },
 ] as const;
 
 interface Props {

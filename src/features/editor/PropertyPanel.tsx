@@ -2,6 +2,7 @@ import type { RefObject } from "react";
 import { Button, Input, InputNumber, Select, TextArea } from "../../ui/semi";
 import { IconCopy, IconDelete, IconDownload, IconPlus } from "@douyinfe/semi-icons";
 import type { PosterAsset, TableField, TextBox } from "../../domain/types";
+import { bindingOptionsOf, bindingPatchOf, bindingValueOf, boundFieldOf } from "./binding-options";
 import { FontHexInput } from "../../ui/FontHexInput";
 
 interface Props {
@@ -10,32 +11,53 @@ interface Props {
   selected: TextBox | null;
   values: Record<string, string>;
   fields: TableField[];
+  templateFields: TableField[];
+  templateTableId: string | null;
   fontAssets: PosterAsset[];
   presetFont: { id: string; label: string };
   disabled: boolean;
   canDownload: boolean;
+  /** 嵌在模板页右栏 tab 内时为 true。 */
+  embedded?: boolean;
   onClose(): void;
   onCopy(): void;
   onDelete(): void;
   onAdd(): void;
   onChange(id: string, updates: Partial<TextBox>, remember?: boolean): void;
   onDownload(): void;
-  onEditMapping(): void;
 }
 
 /** 固定侧栏与右键浮窗共用一份文字属性控件。 */
 export function PropertyPanel(props: Props) {
   const { panelRef, popup, selected, values, fields, fontAssets, presetFont, disabled } = props;
+  // 绑定下拉与映射页共用同一份选项；这里只改当前图层的绑定。
+  const bindingSource = {
+    fields,
+    templateFields: props.templateFields,
+    templateTableId: props.templateTableId,
+  };
+  const bindingValue = selected ? bindingValueOf(selected) : "__fixed__";
+  const bindingOptions = bindingOptionsOf(bindingSource, bindingValue);
+  const boundField = selected ? boundFieldOf(selected, bindingSource) : null;
+  const currentValue = values[bindingValue] ?? "";
+  // 右栏与浮窗可能同屏，锚点 id 要区分开，避免重复 id。
+  const bindingLabelId = popup ? "popup-binding-label" : "property-binding-label";
+  // 嵌在右栏 tab 里时不带栅格列 class，也不占用 tab 的锚点 id。
+  const className = popup
+    ? "right-panel context-properties"
+    : props.embedded
+      ? "right-panel-body"
+      : "right-panel";
   return (
     <aside
-      id="panel-properties"
-      aria-labelledby={popup ? undefined : "tab-properties"}
+      id={props.embedded ? undefined : "panel-properties"}
+      aria-labelledby={popup || props.embedded ? undefined : "tab-properties"}
       ref={panelRef}
       tabIndex={-1}
       role={popup ? "dialog" : undefined}
       aria-modal={popup ? false : undefined}
       aria-label={popup ? "文字框属性" : undefined}
-      className={`right-panel ${popup ? "context-properties" : ""}`}
+      className={className}
       style={popup ? { left: popup.x, top: popup.y } : undefined}
     >
       <div className="panel-section properties-heading">
@@ -82,17 +104,33 @@ export function PropertyPanel(props: Props) {
                 disabled={disabled}
               />
             </label>
+            {/* 绑定下拉常驻：固定文字图层也能在这里直接绑字段。 */}
+            <label className="control-label">
+              <span id={bindingLabelId}>绑定字段</span>
+              <Select
+                aria-labelledby={bindingLabelId}
+                value={bindingValue}
+                optionList={bindingOptions}
+                filter
+                onChange={(next) => {
+                  const patch = bindingPatchOf(String(next));
+                  if (patch) props.onChange(selected.id, patch, true);
+                }}
+                disabled={disabled || selected.locked}
+                style={{ width: "100%" }}
+              />
+            </label>
             {selected.fieldId ? (
-              <div className="bound-field-summary">
-                <span>绑定字段</span>
-                <strong>
-                  {fields.find((field) => field.id === selected.fieldId)?.name ?? "字段已失效"}
-                </strong>
-                <div className="field-value">{values[selected.fieldId] || "当前记录为空"}</div>
-                <Button size="small" onClick={props.onEditMapping} disabled={disabled}>
-                  修改字段映射
-                </Button>
-              </div>
+              <p className={`bound-field-value${boundField ? "" : " is-invalid"}`}>
+                {boundField ? (
+                  <>
+                    <span>{selected.fieldTableId ? "模板行值" : "当前值"}</span>
+                    {currentValue || "（空）"}
+                  </>
+                ) : (
+                  "原字段已删除，请重新选择"
+                )}
+              </p>
             ) : (
               <label className="control-label">
                 内容

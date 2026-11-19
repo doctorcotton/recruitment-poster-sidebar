@@ -1,4 +1,5 @@
 import { layoutText, type TextLayout } from "../domain/layout";
+import { bindingKey } from "../domain/field-binding";
 import { validateTemplate } from "../domain/validation";
 import {
   PosterError,
@@ -95,10 +96,8 @@ export function createPosterRenderer(): PosterRenderer {
       assets.registerFonts(faces);
       for (const box of template.boxes) {
         const family = families.get(box.fontId)!;
-        const text =
-          box.fieldId !== null && Object.hasOwn(values, box.fieldId)
-            ? values[box.fieldId]
-            : box.text;
+        const key = box.fieldId === null ? null : bindingKey(box.fieldTableId, box.fieldId);
+        const text = key !== null && Object.hasOwn(values, key) ? values[key] : box.text;
         let currentSize = 0;
         const setFont = (size: number) => {
           if (currentSize === size) return;

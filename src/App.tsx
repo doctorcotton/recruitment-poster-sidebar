@@ -1,16 +1,7 @@
 // @refresh reset
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Button, Input, Select, Modal, Spin } from "./ui/semi";
-import {
-  IconPlus,
-  IconSave,
-  IconDownload,
-  IconUndo,
-  IconRedo,
-  IconImage,
-  IconFont,
-  IconDelete,
-} from "@douyinfe/semi-icons";
+import { Button, Select, Modal, Spin } from "./ui/semi";
+import { IconSave, IconDownload, IconUndo, IconRedo } from "@douyinfe/semi-icons";
 import type {
   DataRecord,
   PosterAsset,
@@ -21,17 +12,23 @@ import type {
   WorkspaceContext,
   TableSummary,
   StorageStatus,
+  TableField,
+  TemplateRecordValues,
+  TemplateRowSummary,
+  TemplateSource,
 } from "./domain/types";
 import { PosterError } from "./domain/types";
 import { moveTextBox, resizeTextBox } from "./domain/geometry";
 import { createRepository, createPosterAsset } from "./data";
-import { resolveRecordBundle, withRecordBackground } from "./domain/record-background";
+import { scopeValues } from "./domain/field-binding";
 import { PRESET_FONT, withPresetFonts, loadDefaultBundle } from "./data/preset-fonts";
+import { withSourceBackground } from "./application/source-background";
 import { createPosterRenderer } from "./rendering/canvas";
 import { loadWorkspaceBootstrap } from "./domain/workspace-bootstrap";
 import { observeSemiA11y } from "./app/semi-a11y";
 import { OperationLock } from "./application/operation-lock";
 import { resolvePosterActionState } from "./application/action-state";
+import { hasUnsavedChanges } from "./application/draft-state";
 import {
   runBatchWrite,
   summarizeBatch,
@@ -41,6 +38,9 @@ import {
 import { recordPages } from "./domain/record-pages";
 import { findUnwrittenRows, type UnwrittenPlan } from "./application/unwritten-write";
 import { WorkspaceSetup } from "./features/workspace/WorkspaceSetup";
+import { WorkspaceTabs, type WorkspaceTab } from "./features/shell/WorkspaceTabs";
+import { TemplateListPanel } from "./features/template/TemplateListPanel";
+import { TemplateSettingsPanel } from "./features/template/TemplateSettingsPanel";
 import { UnsavedNavigationModal } from "./features/editor/UnsavedNavigationModal";
 import { BatchPanel } from "./features/batch/BatchPanel";
 import { MobileTabs } from "./features/editor/MobileTabs";
@@ -64,6 +64,10 @@ const FieldMappingPanel = lazy(() =>
   })),
 );
 
+const SettingsPanel = lazy(() =>
+  import("./features/settings/SettingsPanel").then((module) => ({ default: module.SettingsPanel })),
+);
+
 const PropertyPanel = lazy(() =>
   import("./features/editor/PropertyPanel").then((module) => ({ default: module.PropertyPanel })),
 );
@@ -85,7 +89,14 @@ function downloadBlob(blob: Blob, name: string) {
 }
 
 type PendingNavigation = { title: string; action: () => Promise<void> | void };
-type WorkspacePage = "records" | "template" | "mapping";
+type WorkspacePage = WorkspaceTab | "mapping";
+/** 模板页右栏的三个分区。 */
+type RightTab = "properties" | "layers" | "settings";
+const RIGHT_TABS: { id: RightTab; label: string }[] = [
+  { id: "properties", label: "属性" },
+  { id: "layers", label: "图层" },
+  { id: "settings", label: "模板设置" },
+];
 
 export default function App() {
   const [repository] = useState(createRepository);
@@ -97,6 +108,8 @@ export default function App() {
   const [tableChoice, setTableChoice] = useState("");
   const [selectingTable, setSelectingTable] = useState(true);
   const [workspacePage, setWorkspacePage] = useState<WorkspacePage>("records");
+  // 字段映射是模板模块的二级页，顶层 tab 始终高亮所属模块。
+  const activeTab: WorkspaceTab = workspacePage === "mapping" ? "template" : workspacePage;
   const [storageStatus, setStorageStatus] = useState<StorageStatus | null>(null);
   const [context, setContext] = useState<WorkspaceContext | null>(null);
   const [template, setTemplate] = useState<PosterTemplate | null>(null);
@@ -132,6 +145,28 @@ export default function App() {
   const [overflowIds, setOverflowIds] = useState<string[]>([]);
   const [savedStamp, setSavedStamp] = useState("");
   const [savedOutputFieldId, setSavedOutputFieldId] = useState("");
+  /** 数据表上指向模板表的查找引用字段，决定当前行使用哪个模板。 */
+  const [templateFieldId, setTemplateFieldId] = useState("");
+  /** 模板表上存底图的附件字段。 */
+  const [templateBackgroundFieldId, setTemplateBackgroundFieldId] = useState("");
+  const [templateFields, setTemplateFields] = useState<TableField[]>([]);
+  /** 模板页列出的模板表行与当前选中行；记录页不读这些状态。 */
+  const [templateRows, setTemplateRows] = useState<TemplateRowSummary[]>([]);
+  const [templatePageRowId, setTemplatePageRowId] = useState<string | null>(null);
+  const [templatePageSource, setTemplatePageSource] = useState<TemplateSource | null>(null);
+  const [templatePageRowValues, setTemplatePageRowValues] = useState<TemplateRecordValues | null>(
+    null,
+  );
+  const [templatePageLoading, setTemplatePageLoading] = useState(false);
+  const [templatePageError, setTemplatePageError] = useState("");
+  /** 进入模板页前的记录页画布快照：定位行未配置时离开模板模块要用它归还画布。 */
+  const templateReturn = useRef<{
+    template: PosterTemplate | null;
+    assets: PosterAsset[];
+    savedStamp: string;
+    templateRevision: number | null;
+  } | null>(null);
+  const [rightTab, setRightTab] = useState<RightTab>("properties");
   const [busy, setBusy] = useState<string | null>(null);
   const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
   const [batchResults, setBatchResults] = useState<BatchRowResult[]>([]);
@@ -162,6 +197,8 @@ export default function App() {
     () => (template ? pruneTemplateAssets({ template, assets }) : null),
     [template, assets],
   );
+  // 版式快照：与保存基线比对即可判断“用户是否真的改过”，撤销回原样也会自动回到干净状态。
+  const templateStamp = useMemo(() => JSON.stringify(template), [template]);
   const records = context?.records;
   const fields = context?.fields;
   const record = useMemo(
@@ -169,14 +206,10 @@ export default function App() {
     [records, recordId],
   );
   const emptyValues = useMemo<Record<string, string>>(() => ({}), []);
-  const values = record?.values ?? emptyValues;
   const selected = template?.boxes.find((item) => item.id === selectedId) ?? null;
   const attachmentFields = useMemo(
-    () =>
-      fields?.filter(
-        (field) => field.kind === "attachment" && field.id !== template?.backgroundFieldId,
-      ) ?? [],
-    [fields, template?.backgroundFieldId],
+    () => fields?.filter((field) => field.kind === "attachment") ?? [],
+    [fields],
   );
   const visibleRecords = useMemo(() => {
     const query = recordSearch.trim().toLocaleLowerCase();
@@ -189,62 +222,262 @@ export default function App() {
     () => records?.filter((row) => selectedRecordIds.has(row.id)) ?? [],
     [records, selectedRecordIds],
   );
-  const backgroundKey = JSON.stringify([context?.tableId, recordId, template?.backgroundFieldId]);
-  const { rowBackground, templateSource, sourceKey, sourceError, sourceLoading } =
+  const backgroundKey = JSON.stringify([
+    context?.tableId,
+    recordId,
+    templateFieldId,
+    templateBackgroundFieldId,
+  ]);
+  const { templateSource, templateRecord, sourceKey, sourceError, sourceLoading } =
     useRecordBackground({
       repository,
       context,
       recordId,
-      backgroundFieldId: template?.backgroundFieldId,
+      locatorFieldId: templateFieldId,
+      backgroundFieldId: templateBackgroundFieldId,
       backgroundKey,
       prepareBundle: withPresetFonts,
-      onRestore: (loaded, fieldId) => {
-        // 来源表保存的是该底图的版式，当前业务表使用自己的底图引用字段。
-        const restored = { ...loaded.template, backgroundFieldId: fieldId };
-        setTemplate(restored);
+      onRestore: (loaded) => {
+        setTemplate(loaded.template);
         setAssets(loaded.assets);
-        setSavedStamp(JSON.stringify(restored));
+        setSavedStamp(JSON.stringify(loaded.template));
         setTemplateRevision(loaded.revision ?? 0);
-        selectCanvasBox(restored.boxes[0]?.id ?? null);
+        selectCanvasBox(loaded.template.boxes[0]?.id ?? null);
         history.current = { undo: [], redo: [] };
       },
-      onNewSource: () => {
-        // 新来源保留当前版式作为草稿，但不得沿用另一来源的“已保存”标记或修订号。
+      onNewSource: (next, warning) => {
+        // 新来源保留当前版式作为草稿，但底图和基线都换成该模板行的真实数据。
+        if (next) {
+          setTemplate(next.template);
+          setAssets(next.assets);
+        }
         setTemplateRevision(null);
-        setSavedStamp("");
+        // 被动切换来源本身不是用户修改：以换底图后的版式为基线，只有后续真实编辑才算未保存。
+        setSavedStamp(next ? JSON.stringify(next.template) : templateStamp);
+        if (warning) setNotice({ kind: "warning", text: warning });
       },
+      draftBundle: () => bundle,
     });
-  const stageBundle = useMemo(
-    () =>
-      !bundle?.template.backgroundFieldId
-        ? bundle
-        : rowBackground?.key === backgroundKey && sourceKey === backgroundKey && rowBackground.asset
-          ? withRecordBackground(bundle, rowBackground.asset)
-          : null,
-    [bundle, rowBackground, backgroundKey, sourceKey],
-  );
+  // 字段映射页与模板页共用同一份手选行草稿，编辑目标与保存目标保持一致。
+  const inTemplateModule = workspacePage === "template" || workspacePage === "mapping";
+  /** 正在编辑的模板行：模板模块用手选行，记录页用查找引用定位到的行。 */
+  const editingSource = inTemplateModule ? templatePageSource : templateSource;
+  const editingReady = inTemplateModule
+    ? Boolean(templatePageSource) && !templatePageLoading
+    : Boolean(templateSource) && sourceKey === backgroundKey;
+  // 数据行变量和模板行文案合成一张扁平值表，图层用绑定键各自取值。
+  const values = useMemo(() => {
+    const base = record?.values ?? emptyValues;
+    const source = editingSource;
+    const row = templatePageRowValues ?? templateRecord;
+    return source && row ? { ...base, ...scopeValues(source.tableId, row.values) } : base;
+  }, [record, editingSource, templatePageRowValues, templateRecord, emptyValues]);
+  const stageBundle = bundle;
   const fontAssets = assets.filter((asset) => template?.fontIds.includes(asset.id));
-  const templateStamp = useMemo(() => JSON.stringify(template), [template]);
-  const dirty = template
-    ? templateStamp !== savedStamp || outputFieldId !== savedOutputFieldId
-    : false;
-  const sourcePending =
+  const dirty = hasUnsavedChanges({
+    templateStamp: template ? templateStamp : "",
+    baselineStamp: savedStamp,
+    outputFieldId,
+    savedOutputFieldId,
+  });
+  const recordSourcePending =
     sourceLoading ||
-    Boolean(template?.backgroundFieldId && sourceKey !== backgroundKey && !sourceError);
+    Boolean(
+      templateFieldId && templateBackgroundFieldId && sourceKey !== backgroundKey && !sourceError,
+    );
+  const sourcePending = inTemplateModule ? templatePageLoading : recordSourcePending;
   const actions = resolvePosterActionState({
     busy,
     sourceLoading: sourcePending,
     sourceError,
     hasTemplate: Boolean(template && context),
-    usesRecordBackground: Boolean(template?.backgroundFieldId),
+    usesRecordBackground: Boolean(templateFieldId),
     hasRecord: Boolean(record),
     hasOutputField: attachmentFields.some((field) => field.id === outputFieldId),
     recordCount: context?.records.length ?? 0,
   });
   const editorDisabled = actions.editorDisabled;
   const controlsDisabled = Boolean(busy || sourcePending);
+  // 模板表字段列表由定位字段的引用表推导，供设置页、属性面板与图层绑定共用。
+  const templateTableId = useMemo(
+    () => fields?.find((field) => field.id === templateFieldId)?.refTableId ?? null,
+    [fields, templateFieldId],
+  );
+  // 右栏内联与右键浮窗共用一份属性面板属性；浮窗要独立渲染，窄屏才不会被右栏隐藏。
+  const propertyPanelProps = {
+    selected,
+    values,
+    fields: context?.fields ?? [],
+    templateFields,
+    templateTableId,
+    fontAssets,
+    presetFont: PRESET_FONT,
+    disabled: controlsDisabled || Boolean(selected?.locked),
+    canDownload: actions.canPreview,
+    onClose: closeProperties,
+    onCopy: copyBox,
+    onDelete: deleteBox,
+    onAdd: addBox,
+    onChange: changeBox,
+    onDownload: () => previewPng(true),
+  };
 
   useEffect(() => observeSemiA11y(), []);
+
+  // 模板列表统一两个数据源：启用模板表时列模板行，否则列本地/独立模板库。
+  const templateListRows = useMemo<TemplateRowSummary[]>(
+    () =>
+      templateTableId
+        ? templateRows
+        : templates.map((item) => ({ recordId: item.id, label: item.name, configured: true })),
+    [templateTableId, templateRows, templates],
+  );
+  const selectedTemplateRowIdForList = templateTableId ? templatePageRowId : (template?.id ?? null);
+  function selectTemplateRow(recordId: string) {
+    // 记录页来源还在定位时不接受手选：此时选中的行会被随后的来源加载覆盖。
+    if (recordSourcePending) return;
+    if (templateTableId) requestTemplateRowChange(recordId);
+    else requestLoad(recordId);
+  }
+
+  useEffect(() => {
+    const refTableId = fields?.find((field) => field.id === templateFieldId)?.refTableId;
+    if (!refTableId) {
+      setTemplateFields((current) => (current.length ? [] : current));
+      return;
+    }
+    let disposed = false;
+    void repository
+      .loadContext(refTableId, false)
+      .then((metadata) => {
+        if (!disposed) setTemplateFields(metadata.fields);
+      })
+      .catch(() => {
+        if (!disposed) setTemplateFields((current) => (current.length ? [] : current));
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [repository, fields, templateFieldId]);
+
+  // 模板页的列表与选中行；记录页不参与这套状态。
+  useEffect(() => {
+    if (!templateTableId || !templateBackgroundFieldId) {
+      setTemplateRows((current) => (current.length ? [] : current));
+      return;
+    }
+    let disposed = false;
+    void repository
+      .listTemplateRows(templateTableId, templateBackgroundFieldId)
+      .then((rows) => {
+        if (!disposed) setTemplateRows(rows);
+      })
+      .catch(() => {
+        if (!disposed) setTemplateRows((current) => (current.length ? [] : current));
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [repository, templateTableId, templateBackgroundFieldId]);
+
+  // 进入模板页时默认选中记录页定位到的模板行，否则取列表第一行。
+  useEffect(() => {
+    if (workspacePage !== "template" || !templateTableId || !templateBackgroundFieldId) return;
+    if (templatePageRowId && templateRows.some((row) => row.recordId === templatePageRowId)) return;
+    // 记录页来源还在定位时不抢选：等 templateSource 落定再选，避免它随后覆盖画布造成选行错位。
+    if (recordSourcePending) return;
+    const fromRecord =
+      templateSource && templateRows.some((row) => row.recordId === templateSource.recordId)
+        ? templateSource.recordId
+        : null;
+    const initial = fromRecord ?? templateRows[0]?.recordId ?? null;
+    if (initial) setTemplatePageRowId(initial);
+  }, [
+    workspacePage,
+    templateTableId,
+    templateBackgroundFieldId,
+    templateRows,
+    templatePageRowId,
+    templateSource,
+    recordSourcePending,
+  ]);
+
+  // 选中行变化时把该行的配置载入编辑器；未配置的行从默认版式开始。
+  useEffect(() => {
+    if (workspacePage !== "template" || !templateTableId || !templateBackgroundFieldId) return;
+    if (!templatePageRowId || templatePageSource?.recordId === templatePageRowId) return;
+    let disposed = false;
+    let firstBoxId: string | null = null;
+    setTemplatePageLoading(true);
+    setTemplatePageError("");
+    void (async () => {
+      const source = await repository.getTemplateSourceByRow(
+        templateTableId,
+        templatePageRowId,
+        templateBackgroundFieldId,
+      );
+      if (disposed) return;
+      const rowValues = await repository.loadTemplateRecord(source);
+      if (disposed) return;
+      const saved = await repository.loadSourceTemplate(source);
+      if (disposed) return;
+      if (saved) {
+        const loaded = await withPresetFonts(saved);
+        if (disposed) return;
+        firstBoxId = loaded.template.boxes[0]?.id ?? null;
+        setTemplate(loaded.template);
+        setAssets(loaded.assets);
+        setSavedStamp(JSON.stringify(loaded.template));
+        setTemplateRevision(loaded.revision ?? 0);
+      } else {
+        const initial = await withPresetFonts(await loadDefaultBundle());
+        if (disposed) return;
+        // 未配置的模板行从默认版式开始，避免把上一行的版式静默存进这一行。
+        initial.template.id = `recruitment-${source.recordId}`;
+        // 版式用默认的，底图仍要取这一行附件字段里的真实图。
+        const draft = await withSourceBackground(repository, initial, source);
+        if (disposed) return;
+        firstBoxId = draft.bundle.template.boxes[0]?.id ?? null;
+        setTemplate(draft.bundle.template);
+        setAssets(draft.bundle.assets);
+        // 选中未配置模板行是浏览动作，落好底图的版式即为该行草稿的基线。
+        setSavedStamp(JSON.stringify(draft.bundle.template));
+        setTemplateRevision(null);
+        if (draft.warning) setNotice({ kind: "warning", text: draft.warning });
+      }
+      setTemplatePageRowValues(rowValues);
+      setTemplatePageSource(source);
+      // 与记录页恢复一致：默认选中第一个图层，属性面板才有可编辑对象。
+      selectCanvasBox(firstBoxId);
+      history.current = { undo: [], redo: [] };
+    })()
+      .catch((error) => {
+        if (!disposed)
+          setTemplatePageError(error instanceof Error ? error.message : "模板行读取失败");
+      })
+      .finally(() => {
+        if (!disposed) setTemplatePageLoading(false);
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [
+    workspacePage,
+    repository,
+    templateTableId,
+    templateBackgroundFieldId,
+    templatePageRowId,
+    templatePageSource,
+  ]);
+
+  // 离开模板模块（含字段映射页）后清掉手选行，编辑器回到记录页由查找引用定位的模板。
+  useEffect(() => {
+    if (workspacePage === "template" || workspacePage === "mapping") return;
+    setTemplatePageRowId(null);
+    setTemplatePageSource(null);
+    setTemplatePageRowValues(null);
+    setTemplatePageError("");
+  }, [workspacePage]);
 
   useEffect(() => {
     let disposed = false;
@@ -331,7 +564,8 @@ export default function App() {
         repository.listTemplates(),
       ]);
       const [firstPage, settings] = await Promise.all([
-        repository.listRecords(tableId),
+        // 首屏记录跟随当前视图：顺序与筛选都和用户在表格里看到的一致。
+        repository.listRecords(tableId, undefined, 50, metadata.viewId),
         repository.loadSettings(tableId),
       ]);
       const workspace = {
@@ -378,20 +612,53 @@ export default function App() {
       );
       if (!savedTemplate) initial.template.id = `recruitment-${workspace.tableId}`;
       if (repository.mode === "feishu" && !savedTemplate) {
-        initial.template.backgroundFieldId =
-          workspace.fields.find(
-            (field) => field.name === "模板底图" && ["attachment", "lookup"].includes(field.kind),
-          )?.id ?? null;
+        // 默认把“海报类型”这类查找引用当作模板入口，用户可在设置页改。
         initial.template.boxes = initial.template.boxes.map((box) => ({
           ...box,
           fieldId: workspace.fields.find((field) => field.name === box.label)?.id ?? null,
         }));
       }
-      if (settings?.backgroundFieldId !== undefined)
-        initial.template.backgroundFieldId = settings.backgroundFieldId;
-      const targets = workspace.fields.filter(
-        (field) => field.kind === "attachment" && field.id !== initial.template.backgroundFieldId,
-      );
+      // 区分「旧配置没有该键」与「用户明确选了不启用」：null 是显式关闭，不能被自动探测推翻。
+      const locatorFieldId =
+        settings && settings.templateFieldId !== undefined
+          ? (settings.templateFieldId ?? "")
+          : repository.mode === "feishu"
+            ? (workspace.fields.find((field) => field.kind === "lookup" && field.refTableId)?.id ??
+              "")
+            : "";
+      let backgroundFieldId = settings?.templateBackgroundFieldId ?? "";
+      const refTableId = workspace.fields.find((field) => field.id === locatorFieldId)?.refTableId;
+      if (refTableId && !backgroundFieldId) {
+        // 模板底图列名不写死：先按名称含“底图”的附件字段兜底，用户仍可在设置页改。
+        const templateMetadata = await repository.loadContext(refTableId, false);
+        backgroundFieldId =
+          templateMetadata.fields.find(
+            (field) => field.kind === "attachment" && field.name.includes("底图"),
+          )?.id ?? "";
+        setTemplateFields(templateMetadata.fields);
+      }
+      initial.template.backgroundFieldId = null;
+      if (!savedTemplate && repository.mode === "feishu" && locatorFieldId && backgroundFieldId) {
+        // 首次打开没有已保存版式，底图仍要取当前记录的模板行附件，不能停在示例图。
+        const currentRecordId = workspace.selectedRecordId;
+        if (currentRecordId) {
+          try {
+            const source = await repository.getTemplateSource(
+              currentRecordId,
+              locatorFieldId,
+              workspace.tableId,
+              backgroundFieldId,
+            );
+            const draft = await withSourceBackground(repository, initial, source);
+            initial.template = draft.bundle.template;
+            initial.assets = draft.bundle.assets;
+            if (draft.warning) setNotice({ kind: "warning", text: draft.warning });
+          } catch {
+            // 定位失败由记录页的来源提示统一呈现，这里保留示例底图继续启动。
+          }
+        }
+      }
+      const targets = workspace.fields.filter((field) => field.kind === "attachment");
       // 旧配置里的目标缺失或失效时，由用户重新绑定，避免改写其他附件列。
       const output = settings
         ? (targets.find((field) => field.id === settings.outputFieldId)?.id ?? "")
@@ -404,10 +671,13 @@ export default function App() {
             tableId: workspace.tableId,
             templateId: savedTemplate ?? null,
             outputFieldId: output || null,
-            backgroundFieldId: initial.template.backgroundFieldId ?? null,
+            templateFieldId: locatorFieldId || null,
+            templateBackgroundFieldId: backgroundFieldId || null,
           },
           null,
         ));
+      setTemplateFieldId(locatorFieldId);
+      setTemplateBackgroundFieldId(backgroundFieldId);
       if (!restoring)
         await repository.saveWorkspaceBinding({
           schemaVersion: 1,
@@ -421,7 +691,7 @@ export default function App() {
       setSavedOutputFieldId(output);
       setTemplateRevision(initial.revision ?? null);
       settingsRevision.current = currentSettings?.updatedAt ?? (currentSettings ? 0 : null);
-      setSavedStamp(savedTemplate ? JSON.stringify(initial.template) : "");
+      setSavedStamp(JSON.stringify(initial.template));
       history.current = { undo: [], redo: [] };
       setSelectedLayerIds(new Set());
       setOutputRevision((value) => value + 1);
@@ -439,6 +709,8 @@ export default function App() {
     propertyTrigger.current =
       document.activeElement instanceof HTMLElement ? document.activeElement : null;
     setSelectedId(id);
+    // 属性浮窗挂在「属性」分区里，先切过去再定位。
+    setRightTab("properties");
     const width = Math.min(304, window.innerWidth - 24),
       height = Math.min(640, window.innerHeight - 24);
     setPropertyPopup({
@@ -632,15 +904,22 @@ export default function App() {
   async function save(): Promise<boolean> {
     if (!bundle) return false;
     return await run("save", async () => {
-      if (bundle.template.backgroundFieldId) {
-        if (!templateSource || sourceKey !== backgroundKey)
-          throw new Error(sourceError || "底图来源还未就绪，请等待或刷新记录");
+      if (templateFieldId) {
+        if (!templateBackgroundFieldId)
+          throw new Error("请先在「设置」里选择模板底图字段，再保存模板");
+        if (!editingSource || !editingReady)
+          throw new Error(templatePageError || sourceError || "模板行还未就绪，请等待或刷新");
         const revision = await repository.saveSourceTemplate(
-          templateSource,
+          editingSource,
           bundle,
           templateRevision,
         );
         setTemplateRevision(revision);
+        // 保存后该行变成已配置，列表状态同步刷新。
+        if (templateTableId && templateBackgroundFieldId)
+          setTemplateRows(
+            await repository.listTemplateRows(templateTableId, templateBackgroundFieldId),
+          );
       } else {
         const summary = await repository.saveTemplate(bundle, templateRevision);
         setTemplateRevision(summary.updatedAt);
@@ -653,7 +932,8 @@ export default function App() {
           tableId: context!.tableId,
           templateId: bundle.template.id,
           outputFieldId: outputFieldId || null,
-          backgroundFieldId: bundle.template.backgroundFieldId ?? null,
+          templateFieldId: templateFieldId || null,
+          templateBackgroundFieldId: templateBackgroundFieldId || null,
         },
         settingsRevision.current,
       );
@@ -662,8 +942,8 @@ export default function App() {
       setSavedStamp(JSON.stringify(bundle.template));
       setNotice({
         kind: "success",
-        text: bundle.template.backgroundFieldId
-          ? "模板和字体已保存到底图来源记录"
+        text: editingSource
+          ? "模板、字体和绑定已保存到模板表记录"
           : repository.mode === "local"
             ? "模板已保存到本地示例库"
             : "模板和素材已保存到多维表",
@@ -679,7 +959,8 @@ export default function App() {
           tableId: context!.tableId,
           templateId: id,
           outputFieldId: outputFieldId || null,
-          backgroundFieldId: next.template.backgroundFieldId ?? null,
+          templateFieldId: templateFieldId || null,
+          templateBackgroundFieldId: templateBackgroundFieldId || null,
         },
         settingsRevision.current,
       );
@@ -746,7 +1027,7 @@ export default function App() {
   }
 
   async function confirmDeleteTemplate() {
-    if (!template || !context || template.backgroundFieldId) return;
+    if (!template || !context || templateFieldId) return;
     const id = template.id;
     let nextId: string | null = null;
     const succeeded = await run("delete-template", async () => {
@@ -763,7 +1044,8 @@ export default function App() {
             tableId: context.tableId,
             templateId: null,
             outputFieldId: outputFieldId || null,
-            backgroundFieldId: null,
+            templateFieldId: templateFieldId || null,
+            templateBackgroundFieldId: templateBackgroundFieldId || null,
           },
           settingsRevision.current,
         );
@@ -840,8 +1122,6 @@ export default function App() {
         if (width * height > MAX_IMAGE_PIXELS || width > MAX_IMAGE_SIDE || height > MAX_IMAGE_SIDE)
           throw new Error("底图尺寸过大");
         checkpoint();
-        if (template.backgroundFieldId)
-          setTemplateRevision(templates.find((item) => item.id === template.id)?.updatedAt ?? null);
         const sx = width / template.width,
           sy = height / template.height;
         setTemplate((current) =>
@@ -851,7 +1131,6 @@ export default function App() {
                 width,
                 height,
                 backgroundId: asset.id,
-                backgroundFieldId: null,
                 boxes: current.boxes.map((box) => ({
                   ...box,
                   x: box.x * sx,
@@ -902,7 +1181,8 @@ export default function App() {
       );
       setTemplate(next);
       setAssets(importedAssets);
-      setTemplateRevision(null);
+      // 模板表模式下导入会写到当前模板行，沿用该行修订号才能覆盖保存；独立模板库仍视为新模板。
+      if (!templateFieldId) setTemplateRevision(null);
       setSavedStamp("");
       selectCanvasBox(next.boxes[0]?.id ?? null);
       history.current = { undo: [], redo: [] };
@@ -913,10 +1193,10 @@ export default function App() {
   async function previewPng(download = false) {
     if (!bundle) return;
     await run("preview", async () => {
-      if (bundle.template.backgroundFieldId && (!templateSource || sourceKey !== backgroundKey))
-        throw new Error(sourceError || "底图模板正在读取，请稍后重试");
-      if (bundle.template.backgroundFieldId && !record) throw new Error("请先选择一条有底图的记录");
-      if (!stageBundle) throw new Error("底图尚未就绪");
+      if (templateFieldId && !editingReady)
+        throw new Error(templatePageError || sourceError || "模板行正在定位，请稍后重试");
+      if (templateFieldId && !record) throw new Error("请先选择一条记录");
+      if (!stageBundle) throw new Error("海报还没有可用的底图");
       const blob = await renderer.png(stageBundle, values);
       if (download) downloadBlob(blob, `${safeFilename(template!.name)}.png`);
       else setPreview({ url: URL.createObjectURL(blob), blob });
@@ -926,13 +1206,15 @@ export default function App() {
     if (!bundle || !context || !rows.length) return;
     await run("write", async ({ details }) => {
       details.rowCount = rows.length;
-      if (bundle.template.backgroundFieldId && (!templateSource || sourceKey !== backgroundKey))
-        throw new Error(sourceError || "底图来源还未就绪，请等待或刷新记录");
+      if (templateFieldId && (!templateSource || sourceKey !== backgroundKey))
+        throw new Error(sourceError || "模板行还未定位，请等待或刷新记录");
       // 记录和字段按不可变方式更新，任务只需固定本轮输入引用。
       const requestedRows = rows;
       lastTask.current = { rows, tableId: context.tableId, fieldId: outputFieldId, emptyOnly };
       const taskContext = { ...context, records: requestedRows };
       const writtenNames = new Map<string, string>();
+      const rowValues = new Map<string, Record<string, string>>();
+      const templateValuesBySource = new Map<string, Record<string, string>>();
       const targetFieldId = outputFieldId,
         currentSource = templateSource;
       const snapshot = {
@@ -949,36 +1231,42 @@ export default function App() {
         targetFieldId,
         controller.signal,
         {
+          templateTable: templateTableId
+            ? { tableId: templateTableId, fields: templateFields }
+            : null,
           prepareBundle: async (row) => {
-            if (!snapshot.template.backgroundFieldId) return snapshot;
+            if (!templateFieldId || !templateBackgroundFieldId) return snapshot;
             const source = await repository.getTemplateSource(
               row.id,
-              snapshot.template.backgroundFieldId,
+              templateFieldId,
               taskContext.tableId,
+              templateBackgroundFieldId,
             );
+            // 同一个模板行只读一次字段值，逐行复用。
+            const sourceId = `${source.tableId}:${source.recordId}`;
+            let scoped = templateValuesBySource.get(sourceId);
+            if (!scoped) {
+              const recordValues = await repository.loadTemplateRecord(source);
+              scoped = scopeValues(source.tableId, recordValues.values);
+              templateValuesBySource.set(sourceId, scoped);
+            }
+            rowValues.set(row.id, scoped);
             // 当前来源使用正在编辑的版式；其他来源读取其各自保存的模板。
-            if (
-              currentSource &&
-              source.recordId === currentSource.recordId &&
-              source.tableId === currentSource.tableId
-            )
+            if (currentSource && sourceId === `${currentSource.tableId}:${currentSource.recordId}`)
               return snapshot;
             const saved = await repository.loadSourceTemplate(source);
-            if (!saved)
-              throw new Error(`底图"${source.recordName}"尚未保存模板，请先选择对应记录配置`);
-            return {
-              ...saved,
-              template: {
-                ...saved.template,
-                backgroundFieldId: snapshot.template.backgroundFieldId,
-              },
-            };
+            if (!saved) throw new Error(`模板“${source.recordName}”尚未保存，请先选择并保存该模板`);
+            return saved;
           },
-          resolveBundle: (row, rowTemplate) =>
-            resolveRecordBundle(rowTemplate, row.id, taskContext, repository),
+          resolveBundle: async (_row, rowTemplate) => rowTemplate,
           readOutputVersion: (row) =>
             repository.readOutputVersion(row.id, targetFieldId, taskContext.tableId),
-          render: (row, resolved, signal) => renderer.png(resolved, row.values, signal),
+          render: (row, resolved, signal) =>
+            renderer.png(
+              resolved,
+              rowValues.has(row.id) ? { ...row.values, ...rowValues.get(row.id) } : row.values,
+              signal,
+            ),
           write: async (row, rowTemplate, blob, expectedVersion) => {
             const file = new File(
               [blob],
@@ -1056,21 +1344,60 @@ export default function App() {
 
   function requestRecordChange(id: string) {
     if (id === recordId || busy) return;
-    if (template?.backgroundFieldId) guardTemplateReplacement("切换记录", () => setRecordId(id));
+    if (templateFieldId) guardTemplateReplacement("切换记录", () => setRecordId(id));
     else setRecordId(id);
   }
 
-  function requestBackgroundFieldChange(value: string) {
-    const fieldId = value === "__template__" ? null : value;
-    if (fieldId === (template?.backgroundFieldId ?? null)) return;
-    guardTemplateReplacement("切换底图来源", () => {
-      edit((current) => ({ ...current, backgroundFieldId: fieldId }));
-      setTemplateRevision(
-        fieldId ? null : (templates.find((item) => item.id === template?.id)?.updatedAt ?? null),
-      );
-      if (outputFieldId === fieldId)
-        setOutputFieldId(attachmentFields.find((field) => field.id !== fieldId)?.id ?? "");
+  function requestTemplateFieldChange(value: string) {
+    const fieldId = value === "__none__" ? "" : value;
+    if (fieldId === templateFieldId) return;
+    guardTemplateReplacement("切换模板定位字段", () => {
+      setTemplateFieldId(fieldId);
+      // 换了定位字段就换了模板表，底图字段必须重新选择。
+      setTemplateBackgroundFieldId("");
+      // 修订号属于来源模板行，来源换了不能拿旧修订号去比对新模板。
+      setTemplateRevision(null);
     });
+  }
+
+  function requestTemplateBackgroundFieldChange(value: string) {
+    const fieldId = value === "__none__" ? "" : value;
+    if (fieldId === templateBackgroundFieldId) return;
+    guardTemplateReplacement("切换模板底图字段", () => setTemplateBackgroundFieldId(fieldId));
+  }
+
+  /** 模板页直接选模板行；记录页的模板仍由查找引用决定。 */
+  function requestTemplateRowChange(recordId: string) {
+    if (recordId === templatePageRowId) return;
+    guardTemplateReplacement("切换模板", () => setTemplatePageRowId(recordId));
+  }
+
+  /** 离开模板页时把编辑器切回查找引用定位到的模板，避免两页共用错误的版式。 */
+  async function restoreRecordTemplate(): Promise<void> {
+    if (!templateSource) return;
+    const snapshot = templateReturn.current;
+    templateReturn.current = null;
+    try {
+      const saved = await repository.loadSourceTemplate(templateSource);
+      if (!saved) {
+        // 定位行没有已保存配置：归还进模板页前借走的画布，不能把手选行草稿残留在记录页。
+        if (!snapshot) return;
+        setTemplate(snapshot.template);
+        setAssets(snapshot.assets);
+        setSavedStamp(snapshot.savedStamp);
+        setTemplateRevision(snapshot.templateRevision);
+        setSelectedId(snapshot.template?.boxes[0]?.id ?? null);
+        history.current = { undo: [], redo: [] };
+        return;
+      }
+      const loaded = await withPresetFonts(saved);
+      setTemplate(loaded.template);
+      setAssets(loaded.assets);
+      setSavedStamp(JSON.stringify(loaded.template));
+      setTemplateRevision(loaded.revision ?? 0);
+    } catch (error) {
+      setNotice({ kind: "error", text: error instanceof Error ? error.message : "模板恢复失败" });
+    }
   }
 
   async function refreshRecords() {
@@ -1078,7 +1405,12 @@ export default function App() {
     await run("refresh", async () => {
       repository.invalidate?.();
       const metadata = await repository.loadContext(context.tableId, false);
-      const firstPage = await repository.listRecords(context.tableId);
+      const firstPage = await repository.listRecords(
+        context.tableId,
+        undefined,
+        50,
+        metadata.viewId,
+      );
       const next = {
         ...metadata,
         records: firstPage.records,
@@ -1096,16 +1428,20 @@ export default function App() {
       if (next.tableId !== context.tableId) {
         const settings = await repository.loadSettings(next.tableId);
         settingsRevision.current = settings?.updatedAt ?? (settings ? 0 : null);
-        setOutputFieldId(
+        // 切表后输出字段来自该表已保存设置，基线必须同步，否则会被误判成未保存修改。
+        const nextOutputFieldId =
           settings?.outputFieldId ??
-            next.fields.find((field) => field.kind === "attachment")?.id ??
-            "",
+          next.fields.find((field) => field.kind === "attachment")?.id ??
+          "";
+        setOutputFieldId(nextOutputFieldId);
+        setSavedOutputFieldId(nextOutputFieldId);
+        // 与启动路径一致：显式保存的 null（不启用）优先于自动探测，仅旧配置缺键时才探测。
+        setTemplateFieldId(
+          settings && settings.templateFieldId !== undefined
+            ? (settings.templateFieldId ?? "")
+            : (next.fields.find((field) => field.kind === "lookup" && field.refTableId)?.id ?? ""),
         );
-        setTemplate((current) =>
-          current
-            ? { ...current, backgroundFieldId: settings?.backgroundFieldId ?? null }
-            : current,
-        );
+        setTemplateBackgroundFieldId(settings?.templateBackgroundFieldId ?? "");
         if (settings?.templateId && templates.some((item) => item.id === settings.templateId)) {
           const nextBundle = await withPresetFonts(
             await repository.loadTemplate(settings.templateId),
@@ -1116,12 +1452,15 @@ export default function App() {
           setTemplateRevision(nextBundle.revision ?? 0);
           setSelectedId(nextBundle.template.boxes[0]?.id ?? null);
           history.current = { undo: [], redo: [] };
+        } else {
+          // 新表没有已保存模板时版式原样保留，切线到当前版式，避免把浏览动作算成修改。
+          setSavedStamp(templateStamp);
         }
       }
     });
   }
   function requestRefresh() {
-    if (template?.backgroundFieldId) guardTemplateReplacement("刷新记录", refreshRecords);
+    if (templateFieldId) guardTemplateReplacement("刷新记录", refreshRecords);
     else void refreshRecords();
   }
 
@@ -1152,7 +1491,12 @@ export default function App() {
   async function loadMoreRecords() {
     if (!context || !recordHasMore) return;
     await run("more-records", async () => {
-      const page = await repository.listRecords(context.tableId, recordPageToken);
+      const page = await repository.listRecords(
+        context.tableId,
+        recordPageToken,
+        50,
+        context.viewId,
+      );
       setContext((current) => {
         if (!current || current.tableId !== context.tableId) return current;
         const records = new Map(current.records.map((row) => [row.id, row]));
@@ -1281,9 +1625,6 @@ export default function App() {
       </div>
     );
 
-  const savedOptions = templates.map((item) => ({ label: item.name, value: item.id }));
-  if (template && !savedOptions.some((item) => item.value === template.id))
-    savedOptions.unshift({ label: template.name, value: template.id });
   return (
     <div className={`app-shell ${busy === "write" ? "is-writing" : ""}`} data-page={workspacePage}>
       <header className="app-header">
@@ -1297,12 +1638,29 @@ export default function App() {
             {repository.mode === "local" ? "本地示例" : "多维表"}
           </span>
         </div>
-        {workspacePage === "records" && (
-          <div className="record-header-main">
-            <span>当前主记录</span>
-            <strong>{record?.label ?? "未选择记录"}</strong>
-          </div>
-        )}
+        <WorkspaceTabs
+          value={activeTab}
+          disabled={Boolean(busy)}
+          onChange={(tab) => {
+            setPropertyPopup(null);
+            if (tab === "records") setMobileTab("canvas");
+            // 字段映射页与模板页同属模板模块，从映射页切走同样要归还画布。
+            const leavingTemplate = activeTab === "template" && tab !== "template";
+            if (tab === "template" && activeTab !== "template")
+              // 进入模板模块前快照记录页画布：定位行未配置时离开要靠它归还。
+              templateReturn.current = { template, assets, savedStamp, templateRevision };
+            // 只有模板页真的改过内容才拦截；刚进入时的默认草稿不该挡住模块切换。
+            if (!leavingTemplate || !history.current.undo.length) {
+              setWorkspacePage(tab);
+              if (leavingTemplate) void restoreRecordTemplate();
+              return;
+            }
+            guardTemplateReplacement("切换模块", async () => {
+              setWorkspacePage(tab);
+              await restoreRecordTemplate();
+            });
+          }}
+        />
         <div className="header-actions">
           {workspacePage === "records" ? (
             <>
@@ -1323,52 +1681,20 @@ export default function App() {
               >
                 生成并写回
               </Button>
-              <Button
-                disabled={!template || Boolean(busy)}
-                onClick={() => {
-                  setPropertyPopup(null);
-                  setMobileTab("canvas");
-                  setWorkspacePage("template");
-                }}
-              >
-                高级编辑
-              </Button>
             </>
-          ) : workspacePage === "template" ? (
-            <>
-              <Button
-                disabled={Boolean(busy)}
-                onClick={() => {
-                  setPropertyPopup(null);
-                  setWorkspacePage("records");
-                }}
-              >
-                返回记录
-              </Button>
-              <Button
-                aria-label="保存模板"
-                icon={<IconSave />}
-                disabled={!actions.canSave}
-                loading={busy === "save"}
-                onClick={save}
-              >
-                保存模板
-              </Button>
-              <Button
-                disabled={controlsDisabled}
-                onClick={() => {
-                  setPropertyPopup(null);
-                  setWorkspacePage("mapping");
-                }}
-              >
-                字段映射
-              </Button>
-            </>
+          ) : workspacePage === "settings" ? (
+            <Button
+              aria-label="保存设置"
+              icon={<IconSave />}
+              disabled={!actions.canSave}
+              title={actions.saveBlockerText || undefined}
+              loading={busy === "save"}
+              onClick={save}
+            >
+              保存设置
+            </Button>
           ) : (
             <>
-              <Button disabled={Boolean(busy)} onClick={() => setWorkspacePage("template")}>
-                返回高级编辑
-              </Button>
               <Button
                 aria-label="保存模板"
                 icon={<IconSave />}
@@ -1378,6 +1704,17 @@ export default function App() {
               >
                 保存模板
               </Button>
+              {workspacePage === "template" && (
+                <Button
+                  disabled={controlsDisabled}
+                  onClick={() => {
+                    setPropertyPopup(null);
+                    setWorkspacePage("mapping");
+                  }}
+                >
+                  字段映射
+                </Button>
+              )}
             </>
           )}
         </div>
@@ -1410,8 +1747,6 @@ export default function App() {
         {!template || workspacePage === "records" ? (
           <RecordWorkspace
             tableName={context.tableName}
-            record={record}
-            fields={context.fields}
             disabled={controlsDisabled}
             onSwitchTable={requestTableSwitch}
             browser={
@@ -1481,8 +1816,8 @@ export default function App() {
                 {template && !attachmentFields.some((field) => field.id === outputFieldId) && (
                   <div className="record-config-warning" role="status">
                     <span>生成前需要配置输出附件字段。</span>
-                    <Button size="small" onClick={() => setWorkspacePage("mapping")}>
-                      去配置
+                    <Button size="small" onClick={() => setWorkspacePage("settings")}>
+                      去设置
                     </Button>
                   </div>
                 )}
@@ -1496,7 +1831,17 @@ export default function App() {
                     <Button
                       size="small"
                       theme="borderless"
-                      onClick={() => setWorkspacePage("template")}
+                      onClick={() => {
+                        // 与顶部页签进入模板模块的路径保持一致：先快照画布再进入。
+                        if (activeTab !== "template")
+                          templateReturn.current = {
+                            template,
+                            assets,
+                            savedStamp,
+                            templateRevision,
+                          };
+                        setWorkspacePage("template");
+                      }}
                     >
                       继续编辑
                     </Button>
@@ -1539,239 +1884,195 @@ export default function App() {
             }
           />
         ) : workspacePage === "template" ? (
-          <main className={`workspace mobile-${mobileTab}`}>
-            <aside className="left-panel" id="panel-layers" aria-labelledby="tab-layers">
-              <section className="panel-section business-table-section">
-                <div className="section-heading">
-                  <h2>业务数据表</h2>
-                  <Button size="small" disabled={controlsDisabled} onClick={requestTableSwitch}>
-                    切换数据表
-                  </Button>
-                </div>
-                <strong>{context.tableName}</strong>
-                <p className="source-template-note">
-                  配置表：{storageStatus?.name ?? "未初始化"}
-                  {storageStatus ? " · 已就绪" : ""}
-                </p>
-              </section>
-              <section className="panel-section">
-                <div className="section-heading">
-                  <h2 id="template-selector-label">模板</h2>
-                  <div className="template-heading-actions">
-                    <span className="save-state">{dirty ? "未保存" : "已保存"}</span>
-                    {!template.backgroundFieldId &&
-                      templates.some((item) => item.id === template.id) && (
-                        <Button
-                          theme="borderless"
-                          type="danger"
-                          icon={<IconDelete />}
-                          aria-label="删除模板"
-                          disabled={controlsDisabled}
-                          onClick={() => setDeletingTemplate(true)}
-                        />
-                      )}
+          <>
+            <main className={`workspace mobile-${mobileTab}`}>
+              <TemplateListPanel
+                rows={templateListRows}
+                selectedRecordId={selectedTemplateRowIdForList}
+                loading={templatePageLoading}
+                error={templatePageError}
+                tableName={context.tableName}
+                storageName={storageStatus?.name ?? null}
+                storageReady={Boolean(storageStatus)}
+                onSelect={selectTemplateRow}
+                onSwitchTable={requestTableSwitch}
+                disabled={controlsDisabled || recordSourcePending}
+              />
+              <div className="canvas-column" id="panel-canvas" aria-labelledby="tab-canvas">
+                <div className="document-bar">
+                  <div>
+                    <span className="document-dot" />
+                    <strong>{template.name}</strong>
+                  </div>
+                  <label className="document-record-select">
+                    <span>预览记录</span>
+                    <Select
+                      aria-label="预览记录"
+                      value={recordId ?? undefined}
+                      optionList={context.records.map((row) => ({
+                        label: row.label,
+                        value: row.id,
+                      }))}
+                      onChange={(value) => requestRecordChange(String(value))}
+                      disabled={controlsDisabled}
+                      size="small"
+                    />
+                  </label>
+                  <div>
                     <Button
                       theme="borderless"
-                      icon={<IconPlus />}
-                      aria-label="新建模板"
-                      disabled={controlsDisabled}
-                      onClick={requestCopyTemplate}
+                      icon={<IconUndo />}
+                      aria-label="撤销"
+                      disabled={!history.current.undo.length || !!busy}
+                      onClick={undo}
+                    />
+                    <Button
+                      theme="borderless"
+                      icon={<IconRedo />}
+                      aria-label="重做"
+                      disabled={!history.current.redo.length || !!busy}
+                      onClick={redo}
                     />
                   </div>
                 </div>
-                {!template.backgroundFieldId && (
-                  <Select
-                    aria-labelledby="template-selector-label"
-                    value={template.id}
-                    optionList={savedOptions}
-                    onChange={(value) => {
-                      if (value !== template.id) requestLoad(String(value));
-                    }}
+                {stageBundle ? (
+                  <EditorStage
+                    renderer={renderer}
+                    bundle={stageBundle}
+                    values={values}
+                    selectedId={selectedId}
                     disabled={controlsDisabled}
-                    style={{ width: "100%" }}
+                    onSelect={selectCanvasBox}
+                    onEditProperties={openProperties}
+                    onChangeBox={changeBox}
+                    onCheckpoint={checkpoint}
+                    onRenderError={notifyRenderError}
+                    onOverflow={notifyOverflow}
                   />
+                ) : (
+                  <div className="background-loading" role="status">
+                    {templatePageError ||
+                      sourceError ||
+                      (templatePageLoading || sourceLoading ? "正在定位模板行…" : "请选择一条记录")}
+                  </div>
                 )}
-                <Input
-                  aria-label="模板名称"
-                  value={template.name}
-                  onChange={(name) => edit((current) => ({ ...current, name }))}
-                  disabled={controlsDisabled}
-                  className="template-name"
-                />
-                <div className="advanced-mapping-summary">
-                  <span>数据映射</span>
-                  <strong>
-                    {template.backgroundFieldId
-                      ? `底图：${context.fields.find((field) => field.id === template.backgroundFieldId)?.name ?? "字段已失效"}`
-                      : "模板固定底图"}
-                  </strong>
-                  {template.backgroundFieldId && (
-                    <p className="source-template-note" role="status">
-                      {sourceError ||
-                        (templateSource
-                          ? `模板来源：${templateSource.tableName} · ${templateSource.recordName}`
-                          : "正在定位底图来源记录…")}
-                    </p>
+              </div>
+              <div className="right-column" id="panel-properties">
+                <div className="right-tabs" role="tablist" aria-label="模板编辑面板">
+                  {RIGHT_TABS.map((tab) => (
+                    <button
+                      key={tab.id}
+                      type="button"
+                      role="tab"
+                      id={`right-tab-${tab.id}`}
+                      aria-selected={rightTab === tab.id}
+                      aria-controls={`right-panel-${tab.id}`}
+                      tabIndex={rightTab === tab.id ? 0 : -1}
+                      className={rightTab === tab.id ? "is-active" : ""}
+                      onClick={() => setRightTab(tab.id)}
+                    >
+                      {tab.label}
+                    </button>
+                  ))}
+                </div>
+                <div
+                  id={`right-panel-${rightTab}`}
+                  role="tabpanel"
+                  aria-labelledby={`right-tab-${rightTab}`}
+                >
+                  {rightTab === "properties" && !propertyPopup && (
+                    <PropertyPanel
+                      embedded
+                      panelRef={propertyPanel}
+                      popup={null}
+                      {...propertyPanelProps}
+                    />
                   )}
-                  <Button
-                    size="small"
-                    onClick={() => {
-                      setPropertyPopup(null);
-                      setWorkspacePage("mapping");
-                    }}
-                  >
-                    修改字段映射
-                  </Button>
-                </div>
-                <div className="asset-buttons">
-                  <Button
-                    icon={<IconImage />}
-                    onClick={() => backgroundInput.current?.click()}
-                    disabled={controlsDisabled}
-                  >
-                    更换底图
-                  </Button>
-                  <Button
-                    icon={<IconFont />}
-                    onClick={() => fontInput.current?.click()}
-                    disabled={controlsDisabled}
-                  >
-                    上传字体
-                  </Button>
-                </div>
-                <div className="asset-buttons">
-                  <Button onClick={() => packageInput.current?.click()} disabled={controlsDisabled}>
-                    导入模板
-                  </Button>
-                  <Button onClick={exportTemplate} disabled={controlsDisabled}>
-                    导出模板
-                  </Button>
-                </div>
-              </section>
-              <LayerPanel
-                boxes={template.boxes}
-                fields={context.fields}
-                selectedId={selectedId}
-                selectedIds={selectedLayerIds}
-                overflowIds={overflowIds}
-                disabled={controlsDisabled}
-                onAdd={addBox}
-                onSelect={selectLayer}
-                onToggle={toggleLayerSelection}
-                onToggleLock={toggleLayerLock}
-                onMove={moveSelectedLayer}
-                onAlign={alignSelectedLayers}
-              />
-              <section className="panel-section advanced-record-selector">
-                <label className="control-label">
-                  <span id="advanced-record-label">预览记录</span>
-                  <Select
-                    aria-labelledby="advanced-record-label"
-                    value={recordId ?? undefined}
-                    optionList={context.records.map((row) => ({ label: row.label, value: row.id }))}
-                    onChange={(value) => requestRecordChange(String(value))}
-                    disabled={controlsDisabled}
-                    style={{ width: "100%" }}
-                  />
-                </label>
-              </section>
-            </aside>
-            <div className="canvas-column" id="panel-canvas" aria-labelledby="tab-canvas">
-              <div className="document-bar">
-                <div>
-                  <span className="document-dot" />
-                  <strong>{template.name}</strong>
-                  <span className="document-record">{record?.label ?? "未选择记录"}</span>
-                </div>
-                <div>
-                  <Button
-                    theme="borderless"
-                    icon={<IconUndo />}
-                    aria-label="撤销"
-                    disabled={!history.current.undo.length || !!busy}
-                    onClick={undo}
-                  />
-                  <Button
-                    theme="borderless"
-                    icon={<IconRedo />}
-                    aria-label="重做"
-                    disabled={!history.current.redo.length || !!busy}
-                    onClick={redo}
-                  />
+                  {rightTab === "layers" && (
+                    <LayerPanel
+                      boxes={template.boxes}
+                      fields={context.fields}
+                      templateFields={templateFields}
+                      selectedId={selectedId}
+                      selectedIds={selectedLayerIds}
+                      overflowIds={overflowIds}
+                      disabled={controlsDisabled}
+                      onAdd={addBox}
+                      onSelect={selectLayer}
+                      onToggle={toggleLayerSelection}
+                      onToggleLock={toggleLayerLock}
+                      onMove={moveSelectedLayer}
+                      onAlign={alignSelectedLayers}
+                    />
+                  )}
+                  {rightTab === "settings" && (
+                    <TemplateSettingsPanel
+                      template={template}
+                      source={editingSource}
+                      fontAssets={fontAssets}
+                      backgroundFieldName={
+                        templateFields.find((field) => field.id === templateBackgroundFieldId)
+                          ?.name ?? ""
+                      }
+                      disabled={controlsDisabled}
+                      showLibraryActions={!templateFieldId}
+                      canDelete={templates.some((item) => item.id === template.id)}
+                      onNameChange={(name) => edit((current) => ({ ...current, name }))}
+                      onEditMapping={() => {
+                        setPropertyPopup(null);
+                        setWorkspacePage("mapping");
+                      }}
+                      onUploadBackground={() => backgroundInput.current?.click()}
+                      onUploadFont={() => fontInput.current?.click()}
+                      onImport={() => packageInput.current?.click()}
+                      onExport={exportTemplate}
+                      onCopyTemplate={requestCopyTemplate}
+                      onDeleteTemplate={() => setDeletingTemplate(true)}
+                    />
+                  )}
                 </div>
               </div>
-              {stageBundle ? (
-                <EditorStage
-                  renderer={renderer}
-                  bundle={stageBundle}
-                  values={values}
-                  selectedId={selectedId}
-                  disabled={controlsDisabled}
-                  onSelect={selectCanvasBox}
-                  onEditProperties={openProperties}
-                  onChangeBox={changeBox}
-                  onCheckpoint={checkpoint}
-                  onRenderError={notifyRenderError}
-                  onOverflow={notifyOverflow}
-                />
-              ) : (
-                <div className="background-loading" role="status">
-                  {sourceError || (rowBackground?.key === backgroundKey && rowBackground.error)
-                    ? sourceError || rowBackground?.error
-                    : recordId
-                      ? "正在读取当前行底图…"
-                      : "请选择一条有底图的记录"}
-                </div>
-              )}
-            </div>
-            <PropertyPanel
-              panelRef={propertyPanel}
-              popup={propertyPopup}
-              selected={selected}
-              values={values}
-              fields={context.fields}
-              fontAssets={fontAssets}
-              presetFont={PRESET_FONT}
-              disabled={controlsDisabled || Boolean(selected?.locked)}
-              canDownload={actions.canPreview}
-              onClose={closeProperties}
-              onCopy={copyBox}
-              onDelete={deleteBox}
-              onAdd={addBox}
-              onChange={changeBox}
-              onDownload={() => previewPng(true)}
-              onEditMapping={() => {
-                setPropertyPopup(null);
-                setWorkspacePage("mapping");
-              }}
-            />
-          </main>
-        ) : (
-          <FieldMappingPanel
-            template={template}
+            </main>
+            {propertyPopup && (
+              <PropertyPanel
+                panelRef={propertyPanel}
+                popup={propertyPopup}
+                {...propertyPanelProps}
+              />
+            )}
+          </>
+        ) : workspacePage === "settings" ? (
+          <SettingsPanel
+            tableName={context.tableName}
+            storageName={storageStatus?.name ?? null}
+            storageReady={Boolean(storageStatus)}
             fields={context.fields}
-            selected={selected}
-            selectedId={selectedId}
-            values={values}
+            templateFields={templateFields}
+            templateFieldId={templateFieldId}
+            templateBackgroundFieldId={templateBackgroundFieldId}
             outputFieldId={outputFieldId}
+            dirty={dirty}
             disabled={controlsDisabled}
-            sourceStatus={
-              sourceError ||
-              (template.backgroundFieldId
-                ? templateSource
-                  ? `模板来源：${templateSource.tableName} · ${templateSource.recordName}`
-                  : "正在定位底图来源记录…"
-                : "模板固定底图")
-            }
-            onSelectLayer={selectCanvasBox}
-            onChange={changeBox}
-            onBackgroundFieldChange={requestBackgroundFieldChange}
+            sourceError={sourceError}
+            onTemplateFieldChange={requestTemplateFieldChange}
+            onTemplateBackgroundFieldChange={requestTemplateBackgroundFieldChange}
             onOutputFieldChange={(id) => {
               setOutputFieldId(id);
               setBatchResults([]);
               setProgress(null);
               lastTask.current = null;
             }}
+            onSwitchTable={requestTableSwitch}
+          />
+        ) : (
+          <FieldMappingPanel
+            template={template}
+            fields={context.fields}
+            templateFields={templateFields}
+            templateTableId={templateTableId}
+            values={values}
+            disabled={controlsDisabled}
+            onChange={changeBox}
           />
         )}
       </Suspense>

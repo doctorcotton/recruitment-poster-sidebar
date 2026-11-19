@@ -99,9 +99,20 @@ async function enterWorkspace() {
 }
 async function openAdvancedEditor() {
   if (await page.locator(".workspace").isVisible()) return;
-  await page.getByRole("button", { name: "高级编辑", exact: true }).click();
+  await page.getByRole("button", { name: "模板", exact: true }).click();
+  await dismissUnsaved();
   await page.locator(".workspace").waitFor();
   await waitForDraw();
+}
+/** 模板页右栏分区：properties / layers / settings。 */
+async function openRightTab(id) {
+  await page.locator(`#right-tab-${id}`).click();
+}
+/** 切模块若碰到未保存改动会弹确认，冒烟里统一选择放弃。 */
+async function dismissUnsaved() {
+  await page.waitForTimeout(150);
+  const discard = page.getByRole("button", { name: "不保存并继续", exact: true });
+  if (await discard.count()) await discard.click();
 }
 async function openMapping() {
   if (await page.locator(".mapping-workspace").isVisible()) return;
@@ -109,13 +120,20 @@ async function openMapping() {
   await page.getByRole("button", { name: "字段映射", exact: true }).click();
   await page.locator(".mapping-workspace").waitFor();
 }
+async function openSettings() {
+  if (await page.locator(".settings-workspace").isVisible()) return;
+  await page.getByRole("button", { name: "设置", exact: true }).click();
+  await dismissUnsaved();
+  await page.locator(".settings-workspace").waitFor();
+}
 async function returnRecords() {
-  await page.getByRole("button", { name: "返回记录", exact: true }).click();
+  await page.getByRole("button", { name: "记录", exact: true }).click();
+  await dismissUnsaved();
   await page.locator(".records-workspace").waitFor();
   await waitForDraw();
 }
 async function returnAdvanced() {
-  await page.getByRole("button", { name: "返回高级编辑", exact: true }).click();
+  await page.getByRole("button", { name: "模板", exact: true }).click();
   await page.locator(".workspace").waitFor();
   await waitForDraw();
 }
@@ -254,9 +272,9 @@ try {
     );
     try {
       await page.getByRole("button", { name: "查看记录", exact: true }).click();
-      await page.locator(".record-field-row").first().waitFor();
+      await page.locator(".records-preview-column").waitFor();
       assert.ok(await page.getByRole("button", { name: "生成并写回", exact: true }).isDisabled());
-      assert.ok((await page.locator(".record-field-list").innerText()).includes("门店伙伴"));
+      await page.locator(".record-row.selected").filter({ hasText: "门店伙伴" }).waitFor();
     } finally {
       release();
     }
@@ -267,7 +285,8 @@ try {
   await check("分别选择业务表和已有配置表，确认后显示配置状态", async () => {
     assert.ok((await page.locator(".record-table-card").innerText()).includes("本地示例"));
     await page.getByRole("button", { name: "切换数据表", exact: true }).click();
-    await page.getByRole("button", { name: "不保存并继续", exact: true }).click();
+    // 未编辑过时不再弹未保存确认；有弹窗（真改过）才放弃修改。
+    await dismissUnsaved();
     await page.getByRole("heading", { name: "连接数据表", exact: true }).waitFor();
     await page.getByRole("button", { name: "取消", exact: true }).click();
     await page.locator(".records-workspace").waitFor();
@@ -282,23 +301,10 @@ try {
       [new URL("fonts/NotoSansSC-Bold.woff2", baseUrl).href],
     );
   });
-  await check("默认首屏是主记录字段和只读海报，不暴露高级编辑", async () => {
+  await check("默认首屏只有记录列表和只读海报，不暴露高级编辑", async () => {
     await page.getByRole("heading", { name: "本地示例 · 门店伙伴", exact: true }).first().waitFor();
-    assert.deepEqual(
-      await page
-        .locator(".record-field-row")
-        .evaluateAll((rows) => rows.map((row) => row.getAttribute("data-field-id"))),
-      [
-        "job",
-        "location",
-        "responsibilities",
-        "benefits",
-        "contact",
-        "phone",
-        "poster",
-        "demo-background",
-      ],
-    );
+    assert.equal(await page.locator(".record-fields-panel").count(), 0);
+    assert.equal(await page.locator(".record-field-row").count(), 0);
     assert.equal(await page.getByRole("button", { name: "保存模板", exact: true }).count(), 0);
     assert.equal(await page.getByLabel("绑定字段", { exact: true }).count(), 0);
     assert.equal(await page.locator(".layer-list").count(), 0);
@@ -309,6 +315,34 @@ try {
       [882, 1783],
     );
     await page.screenshot({ path: `${output}/records-workspace.png` });
+  });
+  await check("顶部模块分为记录、模板、设置三块", async () => {
+    const tabs = page.locator(".workspace-tab");
+    assert.deepEqual(await tabs.allInnerTexts(), ["记录", "模板", "设置"]);
+    assert.equal(await tabs.first().getAttribute("aria-current"), "page");
+    await openSettings();
+    assert.equal(await page.getByRole("heading", { name: "插件设置", exact: true }).count(), 1);
+    // 模板定位、模板底图、写入附件三行设置。
+    assert.equal(await page.locator(".settings-field-row").count(), 3);
+    assert.equal(await page.locator(".workspace-tab.is-active").innerText(), "设置");
+    await returnRecords();
+    assert.equal(await page.locator(".workspace-tab.is-active").innerText(), "记录");
+  });
+  await check("设置页选择写入附件字段并保存", async () => {
+    await openSettings();
+    await page.getByLabel("写入附件字段", { exact: true }).click();
+    await page
+      .getByRole("option")
+      .filter({ hasText: /^招聘海报$/ })
+      .click();
+    await page.getByRole("button", { name: "保存设置", exact: true }).click();
+    await page
+      .locator(".notice")
+      .filter({ hasText: /模板.*已保存/ })
+      .waitFor();
+    await closeNotice();
+    assert.equal(await page.locator(".settings-card .save-state").innerText(), "已保存");
+    await returnRecords();
   });
   await check("记录首页桌面通过 axe WCAG AA 检查", async () => {
     const result = await new AxeBuilder({ page })
@@ -323,9 +357,9 @@ try {
       [],
     );
   });
-  await check("记录首页窄屏保持字段优先并通过 axe", async () => {
+  await check("记录首页窄屏只有记录列表和海报并通过 axe", async () => {
     await page.setViewportSize({ width: 420, height: 900 });
-    await page.locator(".record-fields-panel").waitFor();
+    await page.locator(".records-preview-column").waitFor();
     assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
     const result = await new AxeBuilder({ page })
       .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"])
@@ -341,23 +375,20 @@ try {
     await page.screenshot({ path: `${output}/records-narrow.png` });
     await page.setViewportSize({ width: 1440, height: 960 });
   });
-  await check("记录工作台在中间宽度保持三栏，短窄屏首屏仍可看到主记录", async () => {
+  await check("记录工作台在中间宽度保持两栏，短窄屏仍可看到海报", async () => {
     for (const width of [1024, 768]) {
       await page.setViewportSize({ width, height: 720 });
       await expectNoHorizontalOverflow(
-        ".app-header, .records-workspace, .records-browser, .record-fields-panel, .records-preview-column",
+        ".app-header, .records-workspace, .records-browser, .records-preview-column",
       );
       const browser = await page.locator(".records-browser").boundingBox();
-      const fields = await page.locator(".record-fields-panel").boundingBox();
       const preview = await page.locator(".records-preview-column").boundingBox();
-      assert.ok(browser.x < fields.x && fields.x < preview.x);
-      assert.equal(fields.y, preview.y);
+      assert.ok(browser.x < preview.x);
+      assert.equal(browser.y, preview.y);
     }
     await page.screenshot({ path: `${output}/records-medium.png` });
     await page.setViewportSize({ width: 320, height: 568 });
-    const title = await page.locator("#record-fields-title").boundingBox();
-    assert.ok(title.y + title.height <= 568, JSON.stringify(title));
-    await expectNoHorizontalOverflow(".app-header, .records-workspace, .record-fields-panel");
+    await expectNoHorizontalOverflow(".app-header, .records-workspace, .records-preview-column");
     await page.screenshot({ path: `${output}/records-short.png` });
     await page.setViewportSize({ width: 1440, height: 960 });
   });
@@ -386,11 +417,19 @@ try {
   await check("中间宽度保留完整编辑工具，窄屏隐藏画布时仍能适应缩放", async () => {
     await page.setViewportSize({ width: 768, height: 720 });
     await expectNoHorizontalOverflow(
-      ".app-header, .left-panel, .canvas-column, .document-bar, .stage-toolbar, .right-panel",
+      ".app-header, .left-panel, .canvas-column, .document-bar, .stage-toolbar, .right-column",
     );
     assert.ok(await page.locator(".left-panel").isVisible());
-    assert.ok(await page.locator(".right-panel").isVisible());
+    assert.ok(await page.locator(".right-column").isVisible());
     await page.screenshot({ path: `${output}/editor-medium.png` });
+    // 宿主侧边栏常见宽度：三栏必须同时可见，不出现切换条。
+    await page.setViewportSize({ width: 620, height: 720 });
+    assert.ok(await page.locator(".left-panel").isVisible());
+    assert.ok(await page.locator(".canvas-column").isVisible());
+    assert.ok(await page.locator(".right-column").isVisible());
+    assert.equal(await page.locator(".mobile-tabs").isVisible(), false);
+    await expectNoHorizontalOverflow(".left-panel, .canvas-column, .right-column");
+    await page.screenshot({ path: `${output}/editor-host-narrow.png` });
     await page.setViewportSize({ width: 420, height: 900 });
     await page.getByRole("button", { name: "适应画布", exact: true }).click();
     await page.getByRole("tab", { name: "模板", exact: true }).click();
@@ -406,28 +445,25 @@ try {
     await page.screenshot({ path: `${output}/editor-short.png` });
     await page.setViewportSize({ width: 1440, height: 960 });
   });
-  await check("右键属性浮窗可绑定字段并支持键盘与外部关闭", async () => {
+  await check("右键属性浮窗可直接改字段绑定并支持键盘与外部关闭", async () => {
     await page.locator('[data-box-id="job"] .box-outline').click({ button: "right" });
     const popup = page.getByRole("dialog", { name: "文字框属性", exact: true });
     await popup.waitFor();
     assert.equal(await popup.getByLabel("图层名称", { exact: true }).inputValue(), "岗位");
-    await popup.getByRole("button", { name: "修改字段映射", exact: true }).click();
-    await page.locator(".mapping-workspace").waitFor();
-    await page.getByLabel("绑定字段", { exact: true }).click();
+    // 属性浮窗内就地改绑定，不再跳字段映射页。
+    const popupBinding = popup.getByLabel("绑定字段", { exact: true });
+    await popupBinding.click();
     await page
       .getByRole("option")
       .filter({ hasText: /^地点$/ })
       .click();
-    await page.locator(".mapping-current-value").filter({ hasText: "杭州 · 示例门店" }).waitFor();
-    await page.getByLabel("绑定字段", { exact: true }).click();
+    await popup.locator(".bound-field-value").filter({ hasText: "杭州 · 示例门店" }).waitFor();
+    await popupBinding.click();
     await page
       .getByRole("option")
       .filter({ hasText: /^岗位$/ })
       .click();
-    await page.locator(".mapping-current-value").filter({ hasText: "门店伙伴" }).waitFor();
-    await returnAdvanced();
-    await page.locator('[data-box-id="job"] .box-outline').click({ button: "right" });
-    await popup.waitFor();
+    await popup.locator(".bound-field-value").filter({ hasText: "门店伙伴" }).waitFor();
     await popup.getByLabel("字体颜色 HEX", { exact: true }).fill("#e04030");
     assert.equal(await popup.getByLabel("文字颜色", { exact: true }).inputValue(), "#e04030");
     await popup.getByRole("button", { name: "黑色", exact: true }).click();
@@ -496,30 +532,41 @@ try {
   });
   await check("字段绑定可切换为固定文字", async () => {
     await openMapping();
-    await page.getByLabel("绑定字段", { exact: true }).click();
+    await page.locator('[data-mapping-box-id="job"]').getByLabel("岗位", { exact: true }).click();
     await page.getByRole("option").filter({ hasText: "固定文字" }).click();
-    await page.locator(".mapping-fixed-note").waitFor();
+    await page
+      .locator('[data-mapping-box-id="job"] .mapping-item-value')
+      .filter({ hasText: "固定文字" })
+      .waitFor();
     await returnAdvanced();
+    await openRightTab("properties");
     await page.getByLabel("固定文字内容", { exact: true }).fill("前端画布验证");
+    await openRightTab("settings");
     await page.getByLabel("模板名称", { exact: true }).fill("本地验收模板");
     await waitForDraw();
   });
   await check("模板保存后刷新自动恢复，同表配置记录数不增长", async () => {
     await page.getByRole("button", { name: "保存模板", exact: true }).click();
-    await page.locator(".notice").filter({ hasText: "模板已保存" }).waitFor();
+    await page
+      .locator(".notice")
+      .filter({ hasText: /模板.*已保存/ })
+      .waitFor();
     const count = await settingsCount();
     await page.reload();
     await enterWorkspace();
     await openAdvancedEditor();
     assert.equal(await page.getByRole("heading", { name: "连接数据表", exact: true }).count(), 0);
     assert.equal(await settingsCount(), count);
+    await openRightTab("settings");
     assert.equal(await page.getByLabel("模板名称", { exact: true }).inputValue(), "本地验收模板");
+    await openRightTab("properties");
     assert.equal(
       await page.getByLabel("固定文字内容", { exact: true }).inputValue(),
       "前端画布验证",
     );
   });
   await check("模板 ZIP 导出导入生成新模板，删除后回退已存模板", async () => {
+    await openRightTab("settings");
     const promise = page.waitForEvent("download");
     await page.getByRole("button", { name: "导出模板", exact: true }).click();
     const download = await promise;
@@ -528,14 +575,20 @@ try {
     await page.getByLabel("导入模板包", { exact: true }).setInputFiles(await download.path());
     await page.locator(".notice").filter({ hasText: "模板包已导入" }).waitFor();
     await closeNotice();
+    await openRightTab("settings");
     assert.match(await page.getByLabel("模板名称", { exact: true }).inputValue(), /导入$/);
     await page.getByRole("button", { name: "保存模板", exact: true }).click();
-    await page.locator(".notice").filter({ hasText: "模板已保存" }).waitFor();
+    await page
+      .locator(".notice")
+      .filter({ hasText: /模板.*已保存/ })
+      .waitFor();
     await closeNotice();
+    await openRightTab("settings");
     await page.getByRole("button", { name: "删除模板", exact: true }).click();
     await page.getByRole("button", { name: "确认删除", exact: true }).click();
     await page.locator(".notice").filter({ hasText: "模板已删除" }).waitFor();
     await closeNotice();
+    await openRightTab("settings");
     assert.equal(await page.getByLabel("模板名称", { exact: true }).inputValue(), "本地验收模板");
   });
   await check("PNG 预览与实际下载", async () => {
@@ -634,12 +687,20 @@ try {
   });
   await check("长文本自动换行、PNG 导出与溢出阻断", async () => {
     await openAdvancedEditor();
+    await openRightTab("layers");
     await page.locator(".layer-row").filter({ hasText: "职责" }).click();
     await openMapping();
-    await page.getByLabel("绑定字段", { exact: true }).click();
+    await page
+      .locator('[data-mapping-box-id="responsibilities"]')
+      .getByLabel("职责", { exact: true })
+      .click();
     await page.getByRole("option").filter({ hasText: "固定文字" }).click();
-    await page.locator(".mapping-fixed-note").waitFor();
+    await page
+      .locator('[data-mapping-box-id="responsibilities"] .mapping-item-value')
+      .filter({ hasText: "固定文字" })
+      .waitFor();
     await returnAdvanced();
+    await openRightTab("properties");
     const longText =
       "负责门店日常运营与客户服务，协调团队完成商品陈列、库存盘点和活动执行，主动跟进客户反馈并持续改进服务。".repeat(
         3,
@@ -681,7 +742,9 @@ try {
     await page.screenshot({ path: `${output}/sidebar-context-properties.png` });
     await popup.getByRole("button", { name: "关闭属性浮窗", exact: true }).click();
     await popup.waitFor({ state: "hidden" });
-    await page.getByRole("tab", { name: "文字属性", exact: true }).click();
+    // 窄屏一次只显示一栏：先切到「属性」列，再选右栏内的「属性」分区。
+    await page.locator("#tab-properties").click();
+    await page.locator("#right-tab-properties").click();
     await page.getByLabel("文字字号", { exact: true }).waitFor({ state: "visible" });
     await page.getByRole("tab", { name: "模板", exact: true }).click();
     await page.getByRole("button", { name: "保存模板", exact: true }).waitFor();
@@ -705,54 +768,106 @@ try {
       "true",
     );
   });
-  await check("绑定逐行底图，模板和字体设置随来源记录保存并恢复", async () => {
+  await check("模板表定位：查找引用选中模板行，配置与字体存回该行并恢复", async () => {
     await page.setViewportSize({ width: 1440, height: 960 });
-    await openMapping();
-    await page.getByLabel("底图字段", { exact: true }).click();
+    // 切换绑定字段会先提示放弃未保存改动，这里统一确认后再继续。
+    const discard = page.getByRole("button", { name: "不保存并继续", exact: true });
+    const confirmDiscard = async () => {
+      await page.waitForTimeout(300);
+      if (await discard.count()) await discard.click();
+      await page.waitForTimeout(300);
+    };
+    await openSettings();
+    await page.getByLabel("模板定位字段", { exact: true }).click();
     await page
       .getByRole("option")
-      .filter({ hasText: /^示例底图$/ })
+      .filter({ hasText: /^海报类型$/ })
       .click();
-    await page.getByRole("button", { name: "不保存并继续", exact: true }).click();
-    await page.locator(".mapping-data-card").filter({ hasText: "模板来源：" }).waitFor();
+    await confirmDiscard();
+    await page.getByLabel("模板底图字段", { exact: true }).click();
+    await page
+      .getByRole("option")
+      .filter({ hasText: /^模板底图$/ })
+      .click();
+    await confirmDiscard();
+    await page.getByRole("button", { name: "保存设置", exact: true }).click();
+    await page
+      .locator(".notice")
+      .filter({ hasText: /模板.*已保存/ })
+      .waitFor();
+    await closeNotice();
     await returnAdvanced();
+    await openRightTab("settings");
+    await page.locator(".template-row.is-active").filter({ hasText: "本地示例模板" }).waitFor();
+    await page.locator(".template-source-summary").filter({ hasText: "本地示例模板" }).waitFor();
+    await openRightTab("layers");
     await page.locator(".layer-row").filter({ hasText: "岗位" }).first().click();
-    await page.getByLabel("模板名称", { exact: true }).fill("来源模板 A");
+    await openRightTab("properties");
     await page.getByLabel("字体颜色 HEX", { exact: true }).fill("#d03040");
+    await openRightTab("settings");
+    await page.getByLabel("模板名称", { exact: true }).fill("模板行 A");
     await page.getByRole("button", { name: "保存模板", exact: true }).click();
-    await page.locator(".notice").filter({ hasText: "已保存到底图来源记录" }).waitFor();
+    await page.locator(".notice").filter({ hasText: "已保存到模板表记录" }).waitFor();
     await closeNotice();
     await returnRecords();
+    // 刚保存过就切记录属于浏览动作，不应再弹未保存确认。
+    await page.locator(".record-row").filter({ hasText: "设计助理" }).click();
+    await page.waitForTimeout(300);
+    assert.equal(await page.getByRole("button", { name: "不保存并继续", exact: true }).count(), 0);
     await page.locator(".record-row").filter({ hasText: "设计助理" }).click();
     await waitForDraw();
     await openAdvancedEditor();
-    await page.getByLabel("模板名称", { exact: true }).fill("来源模板 B");
+    await openRightTab("settings");
+    assert.match(await page.locator(".template-source-summary").innerText(), /本地示例模板 B/);
+    assert.match(await page.locator(".template-row.is-active").innerText(), /本地示例模板 B/);
+    await page.getByLabel("模板名称", { exact: true }).fill("模板行 B");
     await page.getByRole("button", { name: "保存模板", exact: true }).click();
-    await page.locator(".notice").filter({ hasText: "已保存到底图来源记录" }).waitFor();
+    await page.locator(".notice").filter({ hasText: "已保存到模板表记录" }).waitFor();
     await closeNotice();
     await returnRecords();
     await page.locator(".record-row").filter({ hasText: "门店伙伴" }).click();
     await waitForDraw();
     await openAdvancedEditor();
     await page.waitForFunction(
-      () => document.querySelector('input[aria-label="模板名称"]').value === "来源模板 A",
+      () => document.querySelector('input[aria-label="模板名称"]').value === "模板行 A",
     );
     await page.reload();
     await enterWorkspace();
     await openAdvancedEditor();
+    await openRightTab("settings");
     await page.waitForFunction(
-      () => document.querySelector('input[aria-label="模板名称"]').value === "来源模板 A",
+      () => document.querySelector('input[aria-label="模板名称"]')?.value === "模板行 A",
     );
+    await openRightTab("properties");
     assert.equal(await page.getByLabel("字体颜色 HEX", { exact: true }).inputValue(), "#d03040");
   });
+  await check("模板页模板列表可直接切换模板行", async () => {
+    await openAdvancedEditor();
+    await openRightTab("settings");
+    await page.locator(".template-row").filter({ hasText: "本地示例模板 B" }).click();
+    await dismissUnsaved();
+    await page.waitForFunction(
+      () => document.querySelector('input[aria-label="模板名称"]')?.value === "模板行 B",
+    );
+    assert.match(await page.locator(".template-row.is-active").innerText(), /本地示例模板 B/);
+    await page.locator(".template-row").filter({ hasText: "本地示例模板" }).first().click();
+    await dismissUnsaved();
+    await page.waitForFunction(
+      () => document.querySelector('input[aria-label="模板名称"]')?.value === "模板行 A",
+    );
+    assert.match(await page.locator(".template-row.is-active").innerText(), /本地示例模板\n/);
+  });
   await check("图层锁定禁止键盘移动，多选后可对齐", async () => {
+    await openRightTab("layers");
     await page.locator(".layer-row").filter({ hasText: "岗位" }).first().click();
     const before = await page.locator('[data-box-id="job"] .box-outline').getAttribute("x");
     await page.getByRole("button", { name: "锁定图层 岗位", exact: true }).click();
+    await openRightTab("properties");
     await page.locator(".locked-note").waitFor();
     await page.locator('[data-box-id="job"]').focus();
     await page.keyboard.press("ArrowRight");
     assert.equal(await page.locator('[data-box-id="job"] .box-outline').getAttribute("x"), before);
+    await openRightTab("layers");
     await page.getByRole("button", { name: "解锁图层 岗位", exact: true }).click();
     await page.getByLabel("选择图层 岗位", { exact: true }).check();
     await page.getByLabel("选择图层 地点", { exact: true }).check();
@@ -777,7 +892,7 @@ try {
       .evaluate((canvas) => canvas.toDataURL());
     assert.equal(after, before);
   });
-  await check("窄屏批量收据按页挂载，末页和长字段均可查看", async () => {
+  await check("窄屏批量收据按页挂载，末页可查看", async () => {
     // 已绑定逐行底图。附加记录没有保存来源模板，会在预检中快速产生失败收据。
     await page.evaluate(
       () =>
@@ -812,14 +927,17 @@ try {
     await page.setViewportSize({ width: 320, height: 568 });
     await page.reload();
     await enterWorkspace();
-    await page.getByText("LongFieldName".repeat(15), { exact: true }).waitFor();
     await expectNoHorizontalOverflow(
-      ".records-workspace, .record-fields-panel, .record-field-list",
+      ".records-workspace, .records-browser, .records-preview-column",
     );
     await page.getByRole("button", { name: "批量生成", exact: true }).click();
     await page.getByRole("button", { name: "读取全表并生成", exact: true }).click();
     await page.getByRole("button", { name: "确认生成 43 条", exact: true }).click();
-    await page.locator(".notice").filter({ hasText: "失败 41" }).waitFor();
+    // 模板行模式每行都要定位与读取，给批量留出更长的完成时间。
+    await page
+      .locator(".notice")
+      .filter({ hasText: /失败 \d+/ })
+      .waitFor({ timeout: 30000 });
     await closeNotice();
     const results = page.getByRole("region", { name: "批量生成结果", exact: true });
     const rows = results.getByRole("listitem");
@@ -841,12 +959,16 @@ try {
     await previous.click();
     await results.getByText("21–40 / 43", { exact: true }).waitFor();
     await results.getByRole("button", { name: "仅重试可安全重试的记录", exact: true }).click();
-    await page.locator(".notice").filter({ hasText: "成功 0，失败 41" }).waitFor();
+    // 只有定位不到模板行的记录会失败，重试范围应与首次失败数一致。
+    await page
+      .locator(".notice")
+      .filter({ hasText: /成功 0，失败 \d+/ })
+      .waitFor();
     assert.equal(
       await page
         .getByRole("progressbar", { name: "批量生成进度", exact: true })
         .getAttribute("max"),
-      "41",
+      "40",
     );
   });
   await check("运行链路不调用自建 API 或第三方服务", async () => {

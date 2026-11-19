@@ -106,6 +106,13 @@ const bundle = (
   assets: [background, font],
 });
 const nextTask = () => new Promise<void>((resolve) => setImmediate(resolve));
+/** 预览绘制发生在 staging 画布上，目标画布只做一次 drawImage。 */
+const drawnTexts = (
+  canvases: { context: { fillText: { mock: { calls: { arguments: unknown[] }[] } } } }[],
+) =>
+  canvases.flatMap((canvas) =>
+    canvas.context.fillText.mock.calls.map((call) => String(call.arguments[0])),
+  );
 
 test("同画布新请求立即取消旧请求，其他画布继续共享底图和字体", async (t) => {
   const { renderer, TestCanvas, images, fontLoads, createUrl, revokeUrl } = setupBrowser(t);
@@ -223,4 +230,40 @@ test("字体别名共享同一 Blob 的解码，文档内仅保留最近使用�
   await renderer.draw(target, data, {}, { preview: true });
   assert.equal(fontLoads.length, 17);
   assert.equal(fonts.size, 16);
+});
+
+test("跨表绑定按表维度取值，数据表字段不会被模板行文案覆盖", async (t) => {
+  const { renderer, TestCanvas, images, canvases } = setupBrowser(t);
+  const data = bundle();
+  const base = DEFAULT_TEMPLATE.boxes[0];
+  data.template.boxes = [
+    { ...base, id: "tpl", fieldId: "shared", fieldTableId: "tpl-table" },
+    { ...base, id: "data", fieldId: "shared", fieldTableId: null },
+  ];
+  const target = new TestCanvas();
+  const draw = renderer.draw(
+    asCanvas(target),
+    data,
+    { "tpl-table::shared": "模板行文案", shared: "数据行文案" },
+    { preview: true },
+  );
+  images[0].onload?.();
+  await draw;
+  const texts = drawnTexts(canvases);
+  assert.deepEqual(texts, ["模板行文案", "数据行文案"]);
+});
+
+test("模板行值缺失时回退固定文字，不会误用数据表同名字段", async (t) => {
+  const { renderer, TestCanvas, images, canvases } = setupBrowser(t);
+  const data = bundle();
+  data.template.boxes = [
+    { ...DEFAULT_TEMPLATE.boxes[0], id: "tpl", fieldId: "shared", fieldTableId: "tpl-table" },
+  ];
+  data.template.boxes[0].text = "固定文案";
+  const target = new TestCanvas();
+  const draw = renderer.draw(asCanvas(target), data, { shared: "数据行文案" }, { preview: true });
+  images[0].onload?.();
+  await draw;
+  const texts = drawnTexts(canvases);
+  assert.deepEqual(texts, ["固定文案"]);
 });

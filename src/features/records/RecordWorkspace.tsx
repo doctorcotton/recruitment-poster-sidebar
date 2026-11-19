@@ -1,12 +1,8 @@
 import type { ReactNode } from "react";
 import { Button } from "../../ui/semi";
-import type { DataRecord, TableField } from "../../domain/types";
-import { RecordFieldsPanel } from "./RecordFieldsPanel";
 
 interface Props {
   tableName: string;
-  record: DataRecord | null;
-  fields: TableField[];
   disabled: boolean;
   browser: ReactNode;
   preview: ReactNode;
@@ -14,7 +10,7 @@ interface Props {
   onSwitchTable(): void;
 }
 
-/** 默认记录工作台：记录选择、主记录字段、只读海报三个清晰区域。 */
+/** 默认记录工作台：左侧记录选择，右侧只读海报预览。 */
 export function RecordWorkspace(props: Props) {
   return (
     <main className="records-workspace">
@@ -28,10 +24,10 @@ export function RecordWorkspace(props: Props) {
         </section>
         {props.browser}
       </aside>
-      <RecordFieldsPanel record={props.record} fields={props.fields}>
+      <div className="records-preview-column">
+        {props.preview}
         {props.extras}
-      </RecordFieldsPanel>
-      <div className="records-preview-column">{props.preview}</div>
+      </div>
     </main>
   );
 }

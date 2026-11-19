@@ -6,6 +6,7 @@ import type { LayerAlignment } from "../../domain/layer-operations";
 interface Props {
   boxes: TextBox[];
   fields: TableField[];
+  templateFields: TableField[];
   selectedId: string | null;
   selectedIds: Set<string>;
   overflowIds: string[];
@@ -16,6 +17,15 @@ interface Props {
   onToggleLock(id: string): void;
   onMove(id: string, direction: -1 | 1): void;
   onAlign(operation: LayerAlignment): void;
+}
+
+/** 图层副标题区分模板表文案、数据表变量和固定文字，失效字段不再显示成“固定文字”。 */
+function layerFieldLabel(box: TextBox, fields: TableField[], templateFields: TableField[]): string {
+  if (!box.fieldId) return "固定文字";
+  const source = box.fieldTableId ? templateFields : fields;
+  const field = source.find((item) => item.id === box.fieldId);
+  if (!field) return "字段已失效";
+  return box.fieldTableId ? `模板表 · ${field.name}` : field.name;
 }
 
 const ALIGNMENTS: { value: LayerAlignment; label: string }[] = [
@@ -89,9 +99,7 @@ export function LayerPanel(props: Props) {
               <span className="layer-letter">T</span>
               <span className="layer-copy">
                 <strong>{box.label}</strong>
-                <small>
-                  {props.fields.find((field) => field.id === box.fieldId)?.name ?? "固定文字"}
-                </small>
+                <small>{layerFieldLabel(box, props.fields, props.templateFields)}</small>
               </span>
               {box.locked ? (
                 <span className="layer-number" title="已锁定">
