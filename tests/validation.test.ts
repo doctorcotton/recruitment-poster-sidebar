@@ -107,6 +107,21 @@ test("字段只能为非空字符串或 null，静态内容不会执行", () => 
   assert.equal(validateTemplate(value).boxes[0].text, value.boxes[0].text);
 });
 
+test("图层可声明绑定表；缺省沿用数据表，非法值拒绝", () => {
+  invalid((value) => {
+    value.boxes[0].fieldTableId = 1;
+  });
+  invalid((value) => {
+    value.boxes[0].fieldTableId = "";
+  });
+  const scoped = structuredClone(DEFAULT_TEMPLATE);
+  scoped.boxes[0].fieldTableId = "tpl-table";
+  assert.equal(validateTemplate(scoped).boxes[0].fieldTableId, "tpl-table");
+  // 旧模板没有该字段仍然通过，也不会凭空补一个 null。
+  const legacy = structuredClone(DEFAULT_TEMPLATE);
+  assert.equal("fieldTableId" in validateTemplate(legacy).boxes[0], false);
+});
+
 test("字号、行高、最大行数和对齐均校验", () => {
   invalid((value) => {
     value.boxes[0].minFontSize = value.boxes[0].fontSize + 1;

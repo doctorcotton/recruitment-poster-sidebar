@@ -72,6 +72,15 @@ export function attachmentVersion(value: unknown): string {
     .join("|");
 }
 
+/** 模板定位只接受唯一引用值；多值或空值必须快速失败，不能拼成一个看似匹配的字符串。 */
+export function lookupKey(value: unknown): string {
+  if (value === null || value === undefined) return "";
+  const items = Array.isArray(value) ? value : [value];
+  if (items.length > 1)
+    throw new PosterError("INVALID_TEMPLATE", "模板定位字段引用了多条记录，无法确定唯一模板。");
+  return cellText(items[0]).trim();
+}
+
 export function backgroundAttachment(value: unknown): SdkAttachment {
   // SDK 的 LookupTransformVal 使用扁平数组表达附件引用，不是附件字段实例或带 value 的包装对象。
   if (value === null || value === undefined || (Array.isArray(value) && value.length === 0)) {

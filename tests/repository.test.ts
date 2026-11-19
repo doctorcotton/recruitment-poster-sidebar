@@ -85,6 +85,7 @@ test("IndexedDB 重新打开后恢复虚构上下文、模板、素材 Blob 与 
       "phone",
       "poster",
       "demo-background",
+      "demo-template-ref",
     ],
   );
   const expected = bundle();
@@ -235,7 +236,12 @@ test("同毫秒内两个本地仓储争用同一修订时，仅一个写入提�
       [first.saveSettings(settings, null), second.saveSettings(settings, null)],
       "REVISION_CONFLICT",
     );
-    const source = await first.getTemplateSource("demo-1", "demo-background", "local-demo");
+    const source = await first.getTemplateSource(
+      "demo-1",
+      "demo-template-ref",
+      "local-demo",
+      "demo-template-background",
+    );
     await expectOneWrite(
       [
         first.saveSourceTemplate(source, bundle(), null),
@@ -479,13 +485,23 @@ test("本地来源配置按记录隔离，重开恢复模板与字体，只保�
     fetcher: (async () => new Response(bytes)) as typeof fetch,
   };
   const repo = new LocalPosterRepository(options);
-  const first = await repo.getTemplateSource("demo-1", "demo-background", "local-demo");
-  const second = await repo.getTemplateSource("demo-2", "demo-background", "local-demo");
+  const first = await repo.getTemplateSource(
+    "demo-1",
+    "demo-template-ref",
+    "local-demo",
+    "demo-template-background",
+  );
+  const second = await repo.getTemplateSource(
+    "demo-2",
+    "demo-template-ref",
+    "local-demo",
+    "demo-template-background",
+  );
   assert.notEqual(first.recordId, second.recordId);
   assert.equal(await repo.loadSourceTemplate(first), null);
   const a = bundle();
   a.template.name = "来源 A";
-  a.template.backgroundFieldId = "demo-background";
+  a.template.backgroundFieldId = "demo-template-background";
   a.template.boxes[0].color = "#123456";
   const b = bundle();
   b.template.name = "来源 B";
@@ -498,9 +514,12 @@ test("本地来源配置按记录隔离，重开恢复模板与字体，只保�
   const invalid = bundle();
   invalid.assets = [];
   await assert.rejects(repo.saveSourceTemplate(first, invalid), { code: "INVALID_ASSET" });
-  await assert.rejects(repo.getTemplateSource("demo-1", "poster", "local-demo"), {
-    code: "INVALID_ASSET",
-  });
+  await assert.rejects(
+    repo.getTemplateSource("demo-1", "demo-template-ref", "local-demo", "poster"),
+    {
+      code: "INVALID_ASSET",
+    },
+  );
   repo.dispose();
   const reopened = new LocalPosterRepository(options);
   const restoredA = (await reopened.loadSourceTemplate(first))!;
@@ -510,7 +529,7 @@ test("本地来源配置按记录隔离，重开恢复模板与字体，只保�
   assert.equal(restoredB.template.name, "来源 B");
   assert.equal(restoredA.template.boxes[0].color, "#123456");
   assert.equal(restoredB.template.boxes[0].color, "#abcdef");
-  assert.equal(restoredA.template.backgroundFieldId, "demo-background");
+  assert.equal(restoredA.template.backgroundFieldId, "demo-template-background");
   assert.equal(
     await restoredA.assets.find((asset) => asset.id === "font")!.blob.text(),
     "font-bytes",
@@ -525,7 +544,7 @@ test("本地来源配置按记录隔离，重开恢复模板与字体，只保�
     const request = db
       .transaction("templates")
       .objectStore("templates")
-      .get("source:local-demo:demo-1");
+      .get("source:local-demo-template:template-1");
     request.onsuccess = () => resolve(request.result);
   });
   assert.deepEqual(
@@ -739,4 +758,50 @@ test("本地连接指针坏值明确失败且保留原值，不生成默认绑�
   repo.dispose();
   await assert.rejects(repo.loadWorkspaceBinding(), { code: "STORAGE_ERROR" });
   await assert.rejects(repo.saveWorkspaceBinding(binding), { code: "STORAGE_ERROR" });
+});
+
+test("本地模板页列出模板行、按行构造来源并按已保存配置标记", async () => {
+  const indexedDB = new IDBFactory();
+  const databaseName = "template-rows";
+  const bytes = await readFile(new URL("../public/demo/clean-background.png", import.meta.url));
+  const options = {
+    indexedDB,
+    databaseName,
+    fetcher: (async () => new Response(bytes)) as typeof fetch,
+  };
+  const repo = new LocalPosterRepository(options);
+  assert.deepEqual(
+    (await repo.listTemplateRows("local-demo-template", "demo-template-background")).map((row) => [
+      row.recordId,
+      row.label,
+      row.configured,
+    ]),
+    [
+      ["template-1", "本地示例模板", false],
+      ["template-2", "本地示例模板 B", false],
+    ],
+  );
+  await assert.rejects(repo.listTemplateRows("local-demo-template", "poster"), {
+    code: "INVALID_ASSET",
+  });
+  const source = await repo.getTemplateSourceByRow(
+    "local-demo-template",
+    "template-2",
+    "demo-template-background",
+  );
+  assert.equal(source.recordName, "本地示例模板 B");
+  await assert.rejects(
+    repo.getTemplateSourceByRow("local-demo-template", "missing", "demo-template-background"),
+    { code: "INVALID_TEMPLATE" },
+  );
+  await repo.saveSourceTemplate(source, bundle());
+  const rows = await repo.listTemplateRows("local-demo-template", "demo-template-background");
+  assert.deepEqual(
+    rows.map((row) => [row.recordId, row.configured]),
+    [
+      ["template-1", false],
+      ["template-2", true],
+    ],
+  );
+  repo.dispose();
 });

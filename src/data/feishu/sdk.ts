@@ -9,7 +9,8 @@ import type {
   ITableMeta,
 } from "@lark-base-open/js-sdk";
 
-export type SdkFieldMeta = Pick<IFieldMeta, "id" | "name" | "type"> & { property?: unknown };
+export type SdkFieldMeta = Pick<IFieldMeta, "id" | "name" | "type"> &
+  Partial<Pick<IFieldMeta, "isPrimary">> & { property?: unknown };
 export type SdkRecord = IRecord;
 export type SdkAttachment = IOpenAttachment;
 export type SdkAttachmentField = Pick<IAttachmentField, "getValue" | "setValue">;

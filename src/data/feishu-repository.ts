@@ -8,6 +8,8 @@ import {
   type StorageStatus,
   type TableSummary,
   type TemplateBundle,
+  type TemplateRecordValues,
+  type TemplateRowSummary,
   type TemplateSource,
   type TemplateSummary,
   type WorkspaceBinding,
@@ -21,9 +23,15 @@ import { normalizeSettings, normalizeWorkspaceBinding, validateBundle } from "./
 import { RequestCache, type RequestCacheOptions } from "./request-cache";
 import { assertRevisionUnchanged, nextRevision } from "./revisions";
 import type { IAddTableConfig, IAttachmentField } from "@lark-base-open/js-sdk";
-import { backgroundAttachment, cellText, FIELD_TYPES, fieldKind, richText } from "./feishu/values";
+import { backgroundAttachment, cellText, FIELD_TYPES, lookupKey, richText } from "./feishu/values";
 import { parseConfig, type SavedAsset, type SavedConfig } from "./feishu/config";
-import { readAllRecords, readRecordPage, toDataRecord } from "./feishu/records";
+import {
+  readAllRecords,
+  readRecordPage,
+  recordLabel,
+  toDataRecord,
+  toTableField,
+} from "./feishu/records";
 import { outputField, readFeishuOutputVersion, writeFeishuPng } from "./feishu/output";
 import type {
   FeishuSdkFacade,
@@ -48,6 +56,8 @@ export { attachmentVersion, cellText } from "./feishu/values";
 export const TEMPLATE_TABLE_NAME = "招聘海报模板";
 export const SETTINGS_TABLE_NAME = "招聘海报配置";
 export const SOURCE_CONFIG_FIELD = "海报模板配置";
+/** 用户表里可能已经写成“模版配置”，两种写法都认，避免模板表出现重复的配置列。 */
+export const SOURCE_CONFIG_ALIASES = [SOURCE_CONFIG_FIELD, "模版配置"];
 export const SOURCE_FONT_FIELD = "海报字体";
 const TEMPLATE_FIELDS: IAddTableConfig["fields"] = [
   { name: "模板ID", type: 1 },
@@ -289,7 +299,11 @@ export class FeishuPosterRepository implements PosterRepository {
     return this.run("读取当前表", async (sdk) => {
       const selection = await sdk.base.getSelection();
       const tableId = explicitTableId ?? selection.tableId;
-      const viewId = explicitTableId === undefined ? selection.viewId : undefined;
+      // 视图只在同表时有效：显式指定别的表时，宿主视图属于当前表而不是目标表。
+      const viewId =
+        explicitTableId === undefined || explicitTableId === selection.tableId
+          ? selection.viewId
+          : undefined;
       if (!tableId || (explicitTableId === undefined && !viewId))
         throw new PosterError("PLATFORM_ERROR", "请在多维表数据视图中打开招聘海报边栏。");
       const previousCache = this.cache;
@@ -318,26 +332,31 @@ export class FeishuPosterRepository implements PosterRepository {
         context.records.some((record) => record.id === selection.recordId)
           ? selection.recordId
           : (context.records[0]?.id ?? null);
-      return structuredClone({ ...context, selectedRecordId });
+      return structuredClone({
+        ...context,
+        selectedRecordId,
+        ...(viewId ? { viewId } : {}),
+      });
     });
   }
 
   private recordFields(table: SdkTable, cache: RequestCache) {
     return cache.get(JSON.stringify(["record-fields", table.id]), async () =>
-      (await table.getFieldMetaList()).map((field) => ({
-        id: field.id,
-        name: field.name,
-        kind: fieldKind(field.type),
-      })),
+      (await table.getFieldMetaList()).map(toTableField),
     );
   }
 
-  listRecords(tableId: string, pageToken?: number, pageSize = 50): Promise<RecordPage> {
+  listRecords(
+    tableId: string,
+    pageToken?: number,
+    pageSize = 50,
+    viewId?: string,
+  ): Promise<RecordPage> {
     const cache = this.cache;
     return this.run("分页读取记录", async (sdk) => {
       const table = await sdk.base.getTableById(tableId);
       const fields = await this.recordFields(table, cache);
-      return readRecordPage(table, fields, pageToken, pageSize);
+      return readRecordPage(table, fields, pageToken, pageSize, viewId);
     });
   }
 
@@ -398,88 +417,152 @@ export class FeishuPosterRepository implements PosterRepository {
     return { ...asset, name: attachment.name };
   }
 
-  getTemplateSource(recordId: string, fieldId: string, tableId: string): Promise<TemplateSource> {
+  getTemplateSource(
+    recordId: string,
+    locatorFieldId: string,
+    tableId: string,
+    backgroundFieldId: string,
+  ): Promise<TemplateSource> {
     const cache = this.cache;
-    return this.run("定位底图来源", async (sdk) => {
-      let table = await sdk.base.getTableById(tableId);
-      let fields = await table.getFieldMetaList();
-      let record = await table.getRecordById(recordId);
-      const field = fields.find((item) => item.id === fieldId);
-      if (field?.type !== FIELD_TYPES.attachment && field?.type !== FIELD_TYPES.lookup)
-        throw new PosterError("INVALID_ASSET", "底图字段必须是附件或附件查找引用。");
-      const attachment = backgroundAttachment(record.fields[fieldId]);
-      if (field.type === FIELD_TYPES.lookup) {
-        const property = field.property as
-          { refTableId?: unknown; refFieldId?: unknown } | undefined;
-        if (
-          typeof property?.refTableId !== "string" ||
-          !property.refTableId ||
-          typeof property.refFieldId !== "string" ||
-          !property.refFieldId
-        ) {
-          throw new PosterError(
-            "INVALID_TEMPLATE",
-            "查找引用缺少来源表或字段，请使用直接引用原附件字段的查找引用。",
-          );
-        }
-        table = await sdk.base.getTableById(property.refTableId);
-        fields = await table.getFieldMetaList();
-        fieldId = property.refFieldId;
-        if (!fields.some((item) => item.id === fieldId && item.type === FIELD_TYPES.attachment))
-          throw new PosterError(
-            "INVALID_TEMPLATE",
-            "查找引用未指向原附件字段，请使用直接引用原附件字段的查找引用。",
-          );
-        // 只认引用字段中的同一 token；重名文件、临时 URL 和表内行顺序均不作为关联依据。
-        const index = await cache.get(
-          JSON.stringify(["source-rows", table.id, fieldId]),
-          async () => {
-            const byToken: Record<string, SdkRecord | null | undefined> = Object.create(null);
-            for (const row of await this.records(table)) {
-              const attachments = row.fields[fieldId];
-              if (!Array.isArray(attachments)) continue;
-              for (const item of attachments) {
-                if (
-                  !item ||
-                  typeof item !== "object" ||
-                  !("token" in item) ||
-                  typeof item.token !== "string"
-                )
-                  continue;
-                const existing = byToken[item.token];
-                byToken[item.token] = existing === undefined || existing === row ? row : null;
-              }
-            }
-            return byToken;
-          },
-        );
-        const match = index[attachment.token];
-        if (!match)
-          throw new PosterError(
-            "INVALID_TEMPLATE",
-            match === null
-              ? "底图匹配多个来源记录，请确保底图仅对应一条来源记录。"
-              : "未找到底图对应的来源记录，请检查来源原附件字段是否仍包含该底图。",
-          );
-        recordId = match.recordId;
-        record = match;
-        backgroundAttachment(record.fields[fieldId]);
+    return this.run("定位模板行", async (sdk) => {
+      const table = await sdk.base.getTableById(tableId);
+      const fields = await table.getFieldMetaList();
+      const locator = fields.find((item) => item.id === locatorFieldId);
+      if (locator?.type !== FIELD_TYPES.lookup)
+        throw new PosterError("INVALID_TEMPLATE", "模板定位字段必须是查找引用字段。");
+      const property = locator.property as
+        { refTableId?: unknown; refFieldId?: unknown } | undefined;
+      if (
+        typeof property?.refTableId !== "string" ||
+        !property.refTableId ||
+        typeof property.refFieldId !== "string" ||
+        !property.refFieldId
+      ) {
+        throw new PosterError("INVALID_TEMPLATE", "查找引用缺少来源表或字段，请重建该字段。");
       }
-      const recordName =
-        fields
-          .filter(
-            (item) => item.type !== FIELD_TYPES.attachment && item.type !== FIELD_TYPES.lookup,
-          )
-          .map((item) => cellText(record.fields[item.id]))
-          .find(Boolean) ?? recordId;
+      const keyFieldId = property.refFieldId;
+      const record = await table.getRecordById(recordId);
+      // 定位键就是查找引用单元格的展示文本，底图是否填写不参与定位。
+      const key = lookupKey(record.fields[locatorFieldId]);
+      if (!key)
+        throw new PosterError(
+          "INVALID_TEMPLATE",
+          `当前记录的“${locator.name}”为空，无法确定使用哪个模板。`,
+        );
+
+      const templateTable = await sdk.base.getTableById(property.refTableId);
+      const templateFields = await templateTable.getFieldMetaList();
+      if (!templateFields.some((item) => item.id === keyFieldId))
+        throw new PosterError("INVALID_TEMPLATE", "查找引用指向的模板字段已不存在，请重建该字段。");
+      if (
+        !templateFields.some(
+          (item) => item.id === backgroundFieldId && item.type === FIELD_TYPES.attachment,
+        )
+      )
+        throw new PosterError("INVALID_ASSET", "模板底图字段必须是模板表的附件字段。");
+
+      const byKey = await cache.get(
+        JSON.stringify(["template-rows", templateTable.id, keyFieldId, key]),
+        async () => {
+          const index: Record<string, SdkRecord[]> = Object.create(null);
+          for (const row of await this.records(templateTable)) {
+            const rowKey = cellText(row.fields[keyFieldId]).trim();
+            if (!rowKey) continue;
+            (index[rowKey] ??= []).push(row);
+          }
+          return index;
+        },
+      );
+      const matches = byKey[key] ?? [];
+      if (matches.length !== 1)
+        throw new PosterError(
+          "INVALID_TEMPLATE",
+          matches.length
+            ? `模板表有 ${matches.length} 行匹配“${key}”，请保证模板键值唯一。`
+            : `模板表里没有“${key}”对应的行，请检查“${locator.name}”的引用值。`,
+        );
+      const templateRecord = matches[0];
+      return {
+        tableId: templateTable.id,
+        tableName: await templateTable.getName(),
+        recordId: templateRecord.recordId,
+        recordName: recordLabel(templateRecord, templateFields.map(toTableField)),
+        backgroundFieldId,
+      };
+    });
+  }
+
+  loadSourceBackground(source: TemplateSource): Promise<PosterAsset> {
+    const cache = this.cache;
+    return this.run("读取模板底图", async (sdk) => {
+      const { table, attachment } = await this.sourceTarget(sdk, source);
+      return this.downloadRecordBackground(
+        table,
+        source.recordId,
+        source.backgroundFieldId,
+        attachment,
+        cache,
+      );
+    });
+  }
+
+  loadTemplateRecord(source: TemplateSource): Promise<TemplateRecordValues> {
+    return this.run("读取模板行", async (sdk) => {
+      const table = await sdk.base.getTableById(source.tableId);
+      const fields = (await table.getFieldMetaList()).map(toTableField);
+      const record = await table.getRecordById(source.recordId);
+      const { values } = toDataRecord({ recordId: source.recordId, fields: record.fields }, fields);
+      return { fields, values };
+    });
+  }
+
+  listTemplateRows(
+    templateTableId: string,
+    backgroundFieldId: string,
+  ): Promise<TemplateRowSummary[]> {
+    return this.run("读取模板行列表", async (sdk) => {
+      const table = await sdk.base.getTableById(templateTableId);
+      const fields = await table.getFieldMetaList();
+      this.assertTemplateBackgroundField(fields, backgroundFieldId);
+      const tableFields = fields.map(toTableField);
+      const { configField } = this.sourceColumns(fields);
+      return (await this.records(table)).map((row) => ({
+        recordId: row.recordId,
+        label: recordLabel(row, tableFields),
+        // 配置损坏的行在列表里标成未配置，由用户点进去重新保存，不让整张列表报错。
+        configured: configField ? hasTemplateConfig(row.fields[configField]) : false,
+      }));
+    });
+  }
+
+  getTemplateSourceByRow(
+    templateTableId: string,
+    recordId: string,
+    backgroundFieldId: string,
+  ): Promise<TemplateSource> {
+    return this.run("读取模板行来源", async (sdk) => {
+      const table = await sdk.base.getTableById(templateTableId);
+      const fields = await table.getFieldMetaList();
+      this.assertTemplateBackgroundField(fields, backgroundFieldId);
+      const record = await table.getRecordById(recordId);
       return {
         tableId: table.id,
         tableName: await table.getName(),
         recordId,
-        recordName,
-        backgroundFieldId: fieldId,
+        recordName: recordLabel(record, fields.map(toTableField)),
+        backgroundFieldId,
       };
     });
+  }
+
+  private assertTemplateBackgroundField(fields: SdkFieldMeta[], backgroundFieldId: string): void {
+    if (
+      !fields.some(
+        (field) => field.id === backgroundFieldId && field.type === FIELD_TYPES.attachment,
+      )
+    ) {
+      throw new PosterError("INVALID_ASSET", "模板底图字段必须是模板表的附件字段。");
+    }
   }
 
   private async sourceTarget(sdk: FeishuSdkFacade, source: TemplateSource) {
@@ -490,7 +573,7 @@ export class FeishuPosterRepository implements PosterRepository {
         (field) => field.id === source.backgroundFieldId && field.type === FIELD_TYPES.attachment,
       )
     ) {
-      throw new PosterError("INVALID_TEMPLATE", "来源记录必须选择原始底图附件字段。");
+      throw new PosterError("INVALID_TEMPLATE", "模板行必须选择模板表里的底图附件字段。");
     }
     const record = await table.getRecordById(source.recordId);
     const attachment = backgroundAttachment(record.fields[source.backgroundFieldId]);
@@ -498,15 +581,23 @@ export class FeishuPosterRepository implements PosterRepository {
   }
 
   private sourceColumns(fields: SdkFieldMeta[]) {
-    const find = (name: string, type: 1 | 17) => {
-      const matches = fields.filter((field) => field.name === name);
-      if (matches.length > 1 || (matches.length && matches[0].type !== type))
-        throw new PosterError("INVALID_TEMPLATE", `来源表的“${name}”字段重名或类型不正确。`);
-      return matches[0]?.id;
+    const find = (names: string[], type: 1 | 17, label: string) => {
+      const matched = names.flatMap((name) => {
+        const matches = fields.filter((field) => field.name === name);
+        if (matches.length > 1 || (matches.length && matches[0].type !== type))
+          throw new PosterError("INVALID_TEMPLATE", `模板表的“${name}”字段重名或类型不正确。`);
+        return matches;
+      });
+      if (matched.length > 1)
+        throw new PosterError(
+          "INVALID_TEMPLATE",
+          `模板表同时存在“${names.join("”和“")}”，请保留其中一列${label}。`,
+        );
+      return matched[0]?.id;
     };
     return {
-      configField: find(SOURCE_CONFIG_FIELD, FIELD_TYPES.text),
-      fontField: find(SOURCE_FONT_FIELD, FIELD_TYPES.attachment),
+      configField: find(SOURCE_CONFIG_ALIASES, FIELD_TYPES.text, "存放模板配置"),
+      fontField: find([SOURCE_FONT_FIELD], FIELD_TYPES.attachment, "存放字体附件"),
     };
   }
 
@@ -557,7 +648,7 @@ export class FeishuPosterRepository implements PosterRepository {
 
   loadSourceTemplate(source: TemplateSource): Promise<TemplateBundle | null> {
     const cache = this.cache;
-    return this.run("读取来源模板", async (sdk) => {
+    return this.run("读取模板行配置", async (sdk) => {
       const { table, fields, record, attachment } = await this.sourceTarget(sdk, source);
       const { configField, fontField } = this.sourceColumns(fields);
       if (!configField || !cellText(record.fields[configField]).trim()) return null;
@@ -570,7 +661,7 @@ export class FeishuPosterRepository implements PosterRepository {
             !config.template.fontIds.includes(asset.id) || !asset.mimeType.startsWith("font/"),
         )
       ) {
-        throw new PosterError("INVALID_ASSET", "来源模板的字体附件清单不完整。");
+        throw new PosterError("INVALID_ASSET", "模板行的字体附件清单不完整。");
       }
       const value = record.fields[fontField];
       const tokens = (Array.isArray(value) ? value : []).flatMap((item) =>
@@ -608,7 +699,7 @@ export class FeishuPosterRepository implements PosterRepository {
     bundle: TemplateBundle,
     expectedUpdatedAt?: number | null,
   ): Promise<number> {
-    return this.write("保存来源模板", async (sdk) => {
+    return this.write("保存模板行配置", async (sdk) => {
       validateBundle(bundle);
       const fonts = bundle.template.fontIds.map((id) =>
         bundle.assets.find((asset) => asset.id === id)!,
@@ -620,13 +711,13 @@ export class FeishuPosterRepository implements PosterRepository {
             asset.blob.size > MAX_ASSET_BYTES,
         )
       ) {
-        throw new PosterError("INVALID_ASSET", "来源模板只允许保存不超过 20 MB 的字体附件。");
+        throw new PosterError("INVALID_ASSET", "模板行只允许保存不超过 20 MB 的字体附件。");
       }
       const { table, fields, record } = await this.sourceTarget(sdk, source);
       const columns = this.sourceColumns(fields);
       const previousValue = columns.configField ? record.fields[columns.configField] : undefined;
       const previous = cellText(previousValue).trim() ? parseConfig(previousValue) : undefined;
-      assertRevisionUnchanged(expectedUpdatedAt, previous?.updatedAt, "来源模板");
+      assertRevisionUnchanged(expectedUpdatedAt, previous?.updatedAt, "模板配置");
       // 两列和版本均验证后再补缺字段，避免在已知冲突时修改用户表结构。
       const configField =
         columns.configField ??
@@ -688,12 +779,12 @@ export class FeishuPosterRepository implements PosterRepository {
           ]),
         ).values(),
       ];
-      // 只更新来源记录的这两个单元格，绝不写回底图、关联字段或其他业务数据。
+      // 只更新模板行的这两个单元格，绝不写回底图、查找引用或其他业务数据。
       const confirmedId = await table.setRecord(source.recordId, {
         fields: { [configField]: richText(serialized), [fontField]: attachments },
       });
       if (!confirmedId || confirmedId !== source.recordId)
-        throw new PosterError("PLATFORM_ERROR", "飞书未确认来源模板写入成功。");
+        throw new PosterError("PLATFORM_ERROR", "飞书未确认模板行写入成功。");
       const confirmed = await table.getRecordById(source.recordId);
       const confirmedFonts = confirmed.fields[fontField];
       const confirmedTokens = new Set(
@@ -707,7 +798,7 @@ export class FeishuPosterRepository implements PosterRepository {
       ) {
         throw new PosterError(
           "PLATFORM_ERROR",
-          "来源模板写入后的配置或字体校验失败，请重新读取确认。",
+          "模板行写入后的配置或字体校验失败，请重新读取确认。",
         );
       }
       return config.updatedAt;
@@ -978,7 +1069,7 @@ export class FeishuPosterRepository implements PosterRepository {
     tableId?: string,
     expectedVersion?: string,
   ): Promise<void> {
-    // 发起操作时捕获目标；PNG 写回只使业务记录快照失效，来源模板缓存可继续复用。
+    // 发起操作时捕获目标；PNG 写回只使业务记录快照失效，模板行缓存可继续复用。
     const requestedTableId = tableId ?? this.activeTableId;
     return this.write(
       "写回 PNG 附件",
@@ -1123,5 +1214,16 @@ export class FeishuPosterRepository implements PosterRepository {
   dispose(): void {
     this.scope?.invalidate.delete(this.invalidateFromScope);
     this.invalidate();
+  }
+}
+
+/** 列表只关心该行有没有可解析配置；坏数据算未配置，不让整张列表不可用。 */
+function hasTemplateConfig(value: unknown): boolean {
+  if (!cellText(value).trim()) return false;
+  try {
+    parseConfig(value);
+    return true;
+  } catch {
+    return false;
   }
 }

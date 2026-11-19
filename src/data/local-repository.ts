@@ -8,6 +8,8 @@ import {
   type StorageStatus,
   type TableSummary,
   type TemplateBundle,
+  type TemplateRecordValues,
+  type TemplateRowSummary,
   type TemplateSource,
   type TemplateSummary,
   type WorkspaceBinding,
@@ -92,6 +94,73 @@ const DEMO_BACKGROUND_FIELD = {
   kind: "attachment" as const,
 };
 
+const DEMO_TEMPLATE_TABLE_ID = "local-demo-template";
+const DEMO_TEMPLATE_TABLE_NAME = "本地示例 · 海报模板（虚构）";
+/** 业务表上的查找引用字段，和真实多维表一样用引用值决定当前行使用哪个模板。 */
+const DEMO_TEMPLATE_FIELD = {
+  id: "demo-template-ref",
+  name: "海报类型",
+  kind: "lookup" as const,
+  refTableId: DEMO_TEMPLATE_TABLE_ID,
+};
+const DEMO_TEMPLATE_KEY_FIELD = {
+  id: "template-key",
+  name: "海报类型",
+  kind: "text" as const,
+  isPrimary: true,
+};
+const DEMO_TEMPLATE_BACKGROUND_FIELD = {
+  id: "demo-template-background",
+  name: "模板底图",
+  kind: "attachment" as const,
+};
+const DEMO_TEMPLATE_RESPONSIBILITY_FIELD = {
+  id: "template-responsibilities",
+  name: "模板职责",
+  kind: "text" as const,
+};
+const DEMO_TEMPLATE_BENEFIT_FIELD = {
+  id: "template-benefits",
+  name: "模板待遇",
+  kind: "text" as const,
+};
+const DEMO_TEMPLATE_KEY = "本地示例模板";
+const DEMO_TEMPLATE_KEY_B = "本地示例模板 B";
+
+function demoTemplateContext(): WorkspaceContext {
+  return {
+    tableId: DEMO_TEMPLATE_TABLE_ID,
+    tableName: DEMO_TEMPLATE_TABLE_NAME,
+    selectedRecordId: "template-1",
+    fields: [
+      DEMO_TEMPLATE_KEY_FIELD,
+      DEMO_TEMPLATE_BACKGROUND_FIELD,
+      DEMO_TEMPLATE_RESPONSIBILITY_FIELD,
+      DEMO_TEMPLATE_BENEFIT_FIELD,
+    ],
+    records: [
+      {
+        id: "template-1",
+        label: DEMO_TEMPLATE_KEY,
+        values: {
+          [DEMO_TEMPLATE_KEY_FIELD.id]: DEMO_TEMPLATE_KEY,
+          [DEMO_TEMPLATE_RESPONSIBILITY_FIELD.id]: "模板固定职责文案",
+          [DEMO_TEMPLATE_BENEFIT_FIELD.id]: "模板固定待遇文案",
+        },
+      },
+      {
+        id: "template-2",
+        label: DEMO_TEMPLATE_KEY_B,
+        values: {
+          [DEMO_TEMPLATE_KEY_FIELD.id]: DEMO_TEMPLATE_KEY_B,
+          [DEMO_TEMPLATE_RESPONSIBILITY_FIELD.id]: "第二个模板的职责文案",
+          [DEMO_TEMPLATE_BENEFIT_FIELD.id]: "第二个模板的待遇文案",
+        },
+      },
+    ],
+  };
+}
+
 function withDemoDisplayValues(record: DataRecord): DataRecord {
   return {
     ...record,
@@ -117,6 +186,7 @@ function demoContext(): WorkspaceContext {
       { id: "phone", name: "电话 / 微信", kind: "phone" },
       { id: "poster", name: "招聘海报", kind: "attachment" },
       DEMO_BACKGROUND_FIELD,
+      DEMO_TEMPLATE_FIELD,
     ],
     records: [
       {
@@ -129,6 +199,7 @@ function demoContext(): WorkspaceContext {
           benefits: "弹性排班 · 成长培训",
           contact: "示例联系人",
           phone: "000-0000-0000",
+          [DEMO_TEMPLATE_FIELD.id]: DEMO_TEMPLATE_KEY,
         },
       },
       {
@@ -141,6 +212,7 @@ function demoContext(): WorkspaceContext {
           benefits: "双休 · 带薪年假",
           contact: "示例负责人",
           phone: "000-0000-0001",
+          [DEMO_TEMPLATE_FIELD.id]: DEMO_TEMPLATE_KEY_B,
         },
       },
       {
@@ -153,6 +225,7 @@ function demoContext(): WorkspaceContext {
           benefits: "餐补 · 岗位培训",
           contact: "示例同事",
           phone: "000-0000-0002",
+          [DEMO_TEMPLATE_FIELD.id]: DEMO_TEMPLATE_KEY,
         },
       },
     ].map(withDemoDisplayValues),
@@ -334,6 +407,10 @@ export class LocalPosterRepository implements PosterRepository {
   }
 
   async loadContext(tableId?: string, includeRecords = true): Promise<WorkspaceContext> {
+    if (tableId === DEMO_TEMPLATE_TABLE_ID) {
+      const template = demoTemplateContext();
+      return includeRecords ? template : { ...template, records: [], selectedRecordId: null };
+    }
     if (tableId !== undefined && tableId !== "local-demo")
       throw new PosterError("INVALID_TEMPLATE", "本地示例数据表不存在。");
     const context = await this.cached("context", () =>
@@ -375,6 +452,23 @@ export class LocalPosterRepository implements PosterRepository {
 
   async loadBackground(recordId: string, fieldId: string, tableId: string): Promise<PosterAsset> {
     const cache = this.cache;
+    if (tableId === DEMO_TEMPLATE_TABLE_ID) {
+      const template = demoTemplateContext();
+      if (
+        fieldId !== DEMO_TEMPLATE_BACKGROUND_FIELD.id ||
+        !template.records.some((record) => record.id === recordId)
+      )
+        throw new PosterError("INVALID_ASSET", "本地示例的模板底图字段或模板行不存在。");
+      return cache
+        .get("demo-background", () =>
+          downloadBackground(
+            "/demo/clean-background.png",
+            "clean-background.png",
+            this.options.fetcher,
+          ),
+        )
+        .then((asset) => structuredClone(asset));
+    }
     const context = await this.loadContext();
     if (tableId !== context.tableId || !context.records.some((record) => record.id === recordId)) {
       throw new PosterError("INVALID_ASSET", "本地示例底图对应的数据表或记录不存在。");
@@ -394,25 +488,104 @@ export class LocalPosterRepository implements PosterRepository {
 
   async getTemplateSource(
     recordId: string,
-    fieldId: string,
+    locatorFieldId: string,
     tableId: string,
+    backgroundFieldId: string,
   ): Promise<TemplateSource> {
     const context = await this.loadContext();
+    if (tableId !== context.tableId || locatorFieldId !== DEMO_TEMPLATE_FIELD.id)
+      throw new PosterError("INVALID_TEMPLATE", "本地示例只支持用“海报类型”定位模板。");
+    if (backgroundFieldId !== DEMO_TEMPLATE_BACKGROUND_FIELD.id)
+      throw new PosterError("INVALID_ASSET", "本地示例的模板底图字段是“模板底图”。");
     const record = context.records.find((item) => item.id === recordId);
-    if (tableId !== context.tableId || !record || fieldId !== DEMO_BACKGROUND_FIELD.id)
-      throw new PosterError("INVALID_ASSET", "请选择本地示例记录的示例底图字段。");
+    if (!record) throw new PosterError("INVALID_TEMPLATE", "本地示例数据行不存在。");
+    const key = record.values[DEMO_TEMPLATE_FIELD.id] ?? "";
+    if (!key) throw new PosterError("INVALID_TEMPLATE", "本地示例记录的“海报类型”为空。");
+    const template = demoTemplateContext();
+    const matches = template.records.filter(
+      (row) => row.values[DEMO_TEMPLATE_KEY_FIELD.id] === key,
+    );
+    if (matches.length !== 1)
+      throw new PosterError(
+        "INVALID_TEMPLATE",
+        matches.length
+          ? `本地示例模板表有 ${matches.length} 行匹配“${key}”。`
+          : `本地示例模板表里没有“${key}”。`,
+      );
     return {
-      tableId,
-      tableName: context.tableName,
-      recordId,
-      recordName: record.label,
-      backgroundFieldId: fieldId,
+      tableId: template.tableId,
+      tableName: template.tableName,
+      recordId: matches[0].id,
+      recordName: matches[0].label,
+      backgroundFieldId,
     };
   }
 
+  /** 本地示例的模板行共用同一张示例底图，与真实附件字段行为保持一致。 */
+  async loadSourceBackground(source: TemplateSource): Promise<PosterAsset> {
+    return this.loadBackground(source.recordId, source.backgroundFieldId, source.tableId);
+  }
+
+  async loadTemplateRecord(source: TemplateSource): Promise<TemplateRecordValues> {
+    if (source.tableId !== DEMO_TEMPLATE_TABLE_ID)
+      throw new PosterError("INVALID_TEMPLATE", "本地示例模板表不存在。");
+    const template = demoTemplateContext();
+    const record = template.records.find((item) => item.id === source.recordId);
+    if (!record) throw new PosterError("INVALID_TEMPLATE", "本地示例模板行不存在。");
+    return { fields: template.fields, values: { ...record.values } };
+  }
+
+  async listTemplateRows(
+    templateTableId: string,
+    backgroundFieldId: string,
+  ): Promise<TemplateRowSummary[]> {
+    const template = this.demoTemplateTable(templateTableId, backgroundFieldId);
+    const keys = await this.transaction<string[]>("templates", "readonly", (store, result) => {
+      const request = store.getAllKeys();
+      request.onsuccess = () => result(request.result.map(String));
+    });
+    return template.records.map((record) => ({
+      recordId: record.id,
+      label: record.label,
+      configured: keys.includes(this.sourceStorageKey(templateTableId, record.id)),
+    }));
+  }
+
+  async getTemplateSourceByRow(
+    templateTableId: string,
+    recordId: string,
+    backgroundFieldId: string,
+  ): Promise<TemplateSource> {
+    const template = this.demoTemplateTable(templateTableId, backgroundFieldId);
+    const record = template.records.find((item) => item.id === recordId);
+    if (!record) throw new PosterError("INVALID_TEMPLATE", "本地示例模板行不存在。");
+    return {
+      tableId: template.tableId,
+      tableName: template.tableName,
+      recordId: record.id,
+      recordName: record.label,
+      backgroundFieldId,
+    };
+  }
+
+  private demoTemplateTable(tableId: string, backgroundFieldId: string): WorkspaceContext {
+    if (tableId !== DEMO_TEMPLATE_TABLE_ID)
+      throw new PosterError("INVALID_TEMPLATE", "本地示例模板表不存在。");
+    if (backgroundFieldId !== DEMO_TEMPLATE_BACKGROUND_FIELD.id)
+      throw new PosterError("INVALID_ASSET", "本地示例的模板底图字段是「模板底图」。");
+    return demoTemplateContext();
+  }
+
+  private sourceStorageKey(tableId: string, recordId: string): string {
+    return `source:${tableId}:${recordId}`;
+  }
+
   private async sourceKey(source: TemplateSource): Promise<string> {
-    await this.getTemplateSource(source.recordId, source.backgroundFieldId, source.tableId);
-    return `source:${source.tableId}:${source.recordId}`;
+    this.demoTemplateTable(source.tableId, source.backgroundFieldId);
+    const template = demoTemplateContext();
+    if (!template.records.some((record) => record.id === source.recordId))
+      throw new PosterError("INVALID_TEMPLATE", "本地示例模板行不存在。");
+    return this.sourceStorageKey(source.tableId, source.recordId);
   }
 
   async loadSourceTemplate(source: TemplateSource): Promise<TemplateBundle | null> {

@@ -66,6 +66,9 @@ export function normalizeSettings(value: unknown, tableId?: string): WorkspaceSe
     !nullableId(value.templateId) ||
     !nullableId(value.outputFieldId) ||
     (value.backgroundFieldId !== undefined && !nullableId(value.backgroundFieldId)) ||
+    (value.templateFieldId !== undefined && !nullableId(value.templateFieldId)) ||
+    (value.templateBackgroundFieldId !== undefined &&
+      !nullableId(value.templateBackgroundFieldId)) ||
     (value.updatedAt !== undefined &&
       (typeof value.updatedAt !== "number" ||
         !Number.isFinite(value.updatedAt) ||
@@ -83,6 +86,12 @@ export function normalizeSettings(value: unknown, tableId?: string): WorkspaceSe
     outputFieldId: value.outputFieldId as string | null,
     ...(value.backgroundFieldId !== undefined
       ? { backgroundFieldId: value.backgroundFieldId as string | null }
+      : {}),
+    ...(value.templateFieldId !== undefined
+      ? { templateFieldId: value.templateFieldId as string | null }
+      : {}),
+    ...(value.templateBackgroundFieldId !== undefined
+      ? { templateBackgroundFieldId: value.templateBackgroundFieldId as string | null }
       : {}),
     ...(value.updatedAt !== undefined ? { updatedAt: value.updatedAt as number } : {}),
   };

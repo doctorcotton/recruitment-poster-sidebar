@@ -325,6 +325,17 @@ test("读取当前视图的分页记录，文本、数字、选项、电话与 U
   ]);
 });
 
+test("记录名称取飞书主字段，主字段为空时显示未命名记录", async () => {
+  const mock = mockSdk();
+  mock.main.fields.find((field) => field.id === "phone")!.isPrimary = true;
+  const repo = new FeishuPosterRepository(mock);
+  const context = await repo.loadContext();
+  assert.deepEqual(
+    context.records.map((record) => record.label),
+    ["012345", "未命名记录", "未命名记录"],
+  );
+});
+
 test("工作区元数据与记录分页分离，全表读取保持兼容", async () => {
   const mock = mockSdk();
   const repo = new FeishuPosterRepository(mock);
@@ -346,6 +357,38 @@ test("工作区元数据与记录分页分离，全表读取保持兼容", async
   assert.equal(second.hasMore, false);
   assert.equal((await repo.loadContext("main")).records.length, 3);
   assert.equal(mock.main.fieldMetaReads, 1);
+});
+
+test("记录列表按视图顺序读取，不传视图时才是表内插入顺序", async () => {
+  const mock = mockSdk();
+  const repo = new FeishuPosterRepository(mock);
+  // 视图内顺序与插入顺序相反：列表必须照视图返回顺序，而不是表底层顺序。
+  const viewOrder = ["r3", "r2", "r1"];
+  mock.main.getRecordsByPage = async (options) => {
+    mock.main.pageCalls.push(options);
+    const order = options.viewId ? viewOrder : ["r1", "r2", "r3"];
+    return {
+      records: order.map((id) => ({
+        recordId: id,
+        fields: structuredClone(mock.main.rows.get(id)!) as SdkRecordInput["fields"],
+      })),
+      total: order.length,
+      hasMore: false,
+      pageToken: order.length,
+    };
+  };
+  const viewed = await repo.listRecords("main", undefined, 50, "view-1");
+  assert.deepEqual(
+    viewed.records.map((row) => row.id),
+    viewOrder,
+  );
+  assert.deepEqual(mock.main.pageCalls.at(-1), { pageSize: 50, viewId: "view-1" });
+  const plain = await repo.listRecords("main", undefined, 50);
+  assert.deepEqual(
+    plain.records.map((row) => row.id),
+    ["r1", "r2", "r3"],
+  );
+  assert.deepEqual(mock.main.pageCalls.at(-1), { pageSize: 50 });
 });
 
 test("保存并重读模板：稳定 ID、刷新附件 URL、完整素材字节、没有临时 URL 持久化", async () => {
@@ -1179,71 +1222,110 @@ test("底图响应体超时 20 秒中止下载并释放串行队列", async (con
 
 function sourceFixture() {
   const mock = mockSdk();
-  const source = new MockTable("source", "底图来源表", [
-    { id: "title", name: "名称", type: 1 },
-    { id: "image", name: "原底图", type: 17 },
+  const source = new MockTable("source", "模板表", [
+    { id: "title", name: "海报类型", type: 1 },
+    { id: "image", name: "模板底图", type: 17 },
   ]);
-  const attachment = attach(mock, "r1", "source-image");
-  source.rows.set("s1", { title: "实际来源", image: [attachment], untouched: "原业务数据" });
+  const attachment: SdkAttachment = {
+    token: "source-image",
+    name: "相同文件名.png",
+    type: "image/png",
+    size: PNG_BYTES.length,
+    timeStamp: 1,
+  };
+  mock.uploads.set(attachment.token, new File([PNG_BYTES], attachment.name, { type: "image/png" }));
+  source.rows.set("s1", { title: "正编业代", image: [attachment], untouched: "原业务数据" });
+  // 数据表用查找引用定位模板行，被引用字段是模板表的文本键，不是附件。
   mock.main.fields.push({
-    id: "background",
-    name: "查找底图",
+    id: "posterType",
+    name: "海报类型",
     type: 19,
-    property: { refTableId: source.id, refFieldId: "image" },
+    property: { refTableId: source.id, refFieldId: "title" },
   });
-  mock.main.rows.get("r1")!.background = [attachment];
+  mock.main.rows.get("r1")!.posterType = [{ text: "正编业代" }];
   const original = mock.sdk.base.getTableById;
   mock.sdk.base.getTableById = async (id) => (id === source.id ? source : original(id));
   return { ...mock, source, attachment };
 }
 
-test("来源通过 Lookup 元数据与 token 唯一匹配，直接附件指向当前行，预览不建字段", async () => {
+test("查找引用值唯一定位模板行，底图来自模板行附件，预览不建字段", async () => {
   const mock = sourceFixture();
   const repo = new FeishuPosterRepository(mock);
-  const source = await repo.getTemplateSource("r1", "background", "main");
+  const source = await repo.getTemplateSource("r1", "posterType", "main", "image");
   assert.deepEqual(source, {
     tableId: "source",
-    tableName: "底图来源表",
+    tableName: "模板表",
     recordId: "s1",
-    recordName: "实际来源",
+    recordName: "正编业代",
     backgroundFieldId: "image",
   });
-  assert.deepEqual(await repo.getTemplateSource("s1", "image", "source"), source);
+  assert.deepEqual(await repo.loadTemplateRecord(source), {
+    fields: [
+      { id: "title", name: "海报类型", kind: "text", isPrimary: undefined },
+      { id: "image", name: "模板底图", kind: "attachment", isPrimary: undefined },
+    ],
+    values: { title: "正编业代" },
+  });
   assert.equal(await repo.loadSourceTemplate(source), null);
   assert.equal(mock.source.addedFields.length, 0);
   assert.equal(mock.state.uploadCalls, 0);
   assert.equal(mock.state.tableExists, false);
 });
 
-test("Lookup 来源零匹配、重复 token、缺少引用元数据与非原附件字段均不猜测", async () => {
+test("模板定位零匹配、多行同键、空引用值、缺少元数据与错误字段均不猜测", async () => {
   const mock = sourceFixture();
   const repo = new FeishuPosterRepository(mock);
-  mock.source.rows.set("duplicate", { title: "同名也不能猜", image: [mock.attachment] });
-  await assert.rejects(repo.getTemplateSource("r1", "background", "main"), {
+  mock.source.rows.set("duplicate", { title: "正编业代", image: [] });
+  await assert.rejects(repo.getTemplateSource("r1", "posterType", "main", "image"), {
     code: "INVALID_TEMPLATE",
   });
+  mock.source.rows.delete("duplicate");
   mock.source.rows.clear();
-  await assert.rejects(repo.getTemplateSource("r1", "background", "main"), {
+  await assert.rejects(repo.getTemplateSource("r1", "posterType", "main", "image"), {
     code: "INVALID_TEMPLATE",
   });
-  const field = mock.main.fields.find((field) => field.id === "background")!;
+  monkeypatchRecordValue(mock, "r1", "posterType", []);
+  await assert.rejects(repo.getTemplateSource("r1", "posterType", "main", "image"), {
+    code: "INVALID_TEMPLATE",
+  });
+  monkeypatchRecordValue(mock, "r1", "posterType", [{ text: "正编业代" }, { text: "销售主管" }]);
+  await assert.rejects(repo.getTemplateSource("r1", "posterType", "main", "image"), {
+    code: "INVALID_TEMPLATE",
+  });
+  monkeypatchRecordValue(mock, "r1", "posterType", [{ text: "正编业代" }]);
+  const field = mock.main.fields.find((item) => item.id === "posterType")!;
   field.property = undefined;
-  await assert.rejects(repo.getTemplateSource("r1", "background", "main"), {
+  await assert.rejects(repo.getTemplateSource("r1", "posterType", "main", "image"), {
+    code: "INVALID_TEMPLATE",
+  });
+  field.property = { refTableId: "source", refFieldId: "missing" };
+  await assert.rejects(repo.getTemplateSource("r1", "posterType", "main", "image"), {
     code: "INVALID_TEMPLATE",
   });
   field.property = { refTableId: "source", refFieldId: "title" };
-  await assert.rejects(repo.getTemplateSource("r1", "background", "main"), {
-    code: "INVALID_TEMPLATE",
+  // 模板底图字段必须是模板表的附件字段。
+  await assert.rejects(repo.getTemplateSource("r1", "posterType", "main", "title"), {
+    code: "INVALID_ASSET",
   });
   assert.equal(mock.source.setRecordCalls.length, 0);
 });
 
+/** MockTable 的记录是普通对象，这里只替换定位字段的值以便覆盖多值与空值分支。 */
+function monkeypatchRecordValue(
+  mock: ReturnType<typeof sourceFixture>,
+  recordId: string,
+  fieldId: string,
+  value: unknown,
+) {
+  mock.main.rows.get(recordId)![fieldId] = value;
+}
+
 test("来源配置仅显式保存时创建字段、上传字体，来源业务字段和底图保持原值且可重开恢复", async () => {
   const mock = sourceFixture();
   const repo = new FeishuPosterRepository(mock);
-  const source = await repo.getTemplateSource("r1", "background", "main");
+  const source = await repo.getTemplateSource("r1", "posterType", "main", "image");
   const expected = bundle();
-  expected.template.backgroundFieldId = "background";
+  expected.template.backgroundFieldId = "image";
   await repo.saveSourceTemplate(source, expected);
   assert.deepEqual(
     mock.source.addedFields.map((field) => [field.name, field.type]),
@@ -1274,7 +1356,7 @@ test("来源配置仅显式保存时创建字段、上传字体，来源业务�
   const recordReads = mock.source.recordReads;
   const loaded = (await reopened.loadSourceTemplate(source))!;
   assert.equal(mock.source.recordReads, recordReads + 1);
-  assert.equal(loaded.template.backgroundFieldId, "background");
+  assert.equal(loaded.template.backgroundFieldId, "image");
   assert.equal(loaded.template.backgroundId, `asset-${await hashBlob(new Blob([PNG_BYTES]))}`);
   assert.equal(await loaded.assets.find((asset) => asset.id === "font")!.blob.text(), "font-v1");
   const urlReads = mock.source.urlGeneration;
@@ -1302,7 +1384,7 @@ test("来源配置仅显式保存时创建字段、上传字体，来源业务�
 test("来源字段类型冲突、字体缺失/损坏、写入拒绝和错误回读均明确失败", async () => {
   const mock = sourceFixture();
   const repo = new FeishuPosterRepository(mock);
-  const source = await repo.getTemplateSource("r1", "background", "main");
+  const source = await repo.getTemplateSource("r1", "posterType", "main", "image");
   mock.source.fields.push({ id: "bad-config", name: SOURCE_CONFIG_FIELD, type: 17 });
   await assert.rejects(repo.saveSourceTemplate(source, bundle()), { code: "INVALID_TEMPLATE" });
   mock.source.fields.pop();
@@ -1340,28 +1422,29 @@ test("来源字段类型冲突、字体缺失/损坏、写入拒绝和错误回�
 test("来源分页快照跨逐行 PNG 输出复用，显式保存、刷新与 Base 切换重新扫描", async () => {
   const mock = sourceFixture();
   const repo = new FeishuPosterRepository(mock);
-  mock.main.rows.get("r2")!.background = [mock.attachment];
+  mock.main.rows.get("r2")!.posterType = [{ text: "正编业代" }];
   mock.source.rows.set("other-1", { title: "其他记录", image: [] });
   mock.source.rows.set("other-2", { title: "另一页记录", image: [] });
   await repo.loadContext();
-  const first = await repo.getTemplateSource("r1", "background", "main");
+  const first = await repo.getTemplateSource("r1", "posterType", "main", "image");
   assert.equal(mock.source.pageCalls.length, 2);
   await repo.writePng("r1", "poster", new File(["png"], "a.png", { type: "image/png" }), "main");
-  await repo.getTemplateSource("r2", "background", "main");
+  await repo.getTemplateSource("r2", "posterType", "main", "image");
   await repo.writePng("r2", "poster", new File(["png"], "b.png", { type: "image/png" }), "main");
-  await repo.getTemplateSource("r1", "background", "main");
+  await repo.getTemplateSource("r1", "posterType", "main", "image");
   assert.equal(mock.source.pageCalls.length, 2);
   await repo.saveSourceTemplate(first, bundle());
-  await repo.getTemplateSource("r1", "background", "main");
+  await repo.getTemplateSource("r1", "posterType", "main", "image");
   assert.equal(mock.source.pageCalls.length, 4);
   repo.invalidate();
-  await repo.getTemplateSource("r1", "background", "main");
+  await repo.getTemplateSource("r1", "posterType", "main", "image");
   assert.equal(mock.source.pageCalls.length, 6);
   mock.source.rows.get("s1")!.title = "另一 Base 的来源";
+  mock.main.rows.get("r1")!.posterType = [{ text: "另一 Base 的来源" }];
   mock.state.baseId = "base-2";
   await repo.loadContext();
   assert.equal(
-    (await repo.getTemplateSource("r1", "background", "main")).recordName,
+    (await repo.getTemplateSource("r1", "posterType", "main", "image")).recordName,
     "另一 Base 的来源",
   );
   assert.equal(mock.source.pageCalls.length, 8);
@@ -1410,13 +1493,19 @@ test("显式业务表按实际 ID 隔离相同字段和记录 ID，不借用其�
   assert.deepEqual(requested, ["other", "main"]);
   mock.state.tableId = "other";
   mock.state.recordId = "r2";
-  assert.equal((await repo.loadContext("other")).selectedRecordId, "r2");
-  // 显式模式不依赖宿主视图，切换 Base 后原上下文缓存必须失效。
+  // 显式表与宿主当前表相同时采纳宿主视图，视图不同即新的读取范围。
+  const sameTable = await repo.loadContext("other");
+  assert.equal(sameTable.selectedRecordId, "r2");
+  assert.equal(sameTable.viewId, "view-1");
+  assert.equal(other.pageCalls.length, 4);
+  // 视图清空后不依赖视图，切换 Base 后原上下文缓存必须失效。
   mock.state.viewId = "";
   mock.state.baseId = "base-2";
   other.rows.get("r1")!.job = "新 Base 岗位";
-  assert.equal((await repo.loadContext("other")).records[0].values.job, "新 Base 岗位");
-  assert.equal(other.pageCalls.length, 4);
+  const refreshed = await repo.loadContext("other");
+  assert.equal(refreshed.records[0].values.job, "新 Base 岗位");
+  assert.equal(refreshed.viewId, undefined);
+  assert.equal(other.pageCalls.length, 6);
   await assert.rejects(repo.loadContext(), { code: "PLATFORM_ERROR" });
 });
 
@@ -1847,4 +1936,62 @@ test("宿主空绑定不阻断首次连接，JSON 文本绑定可恢复并验证
   await repo.saveWorkspaceBinding(binding);
   assert.equal(mock.tableCreations(), 0);
   repo.dispose();
+});
+
+test("模板页按行列出模板表：只取主字段文本并标记是否已配置", async () => {
+  const mock = sourceFixture();
+  const repo = new FeishuPosterRepository(mock);
+  assert.deepEqual(await repo.listTemplateRows("source", "image"), [
+    { recordId: "s1", label: "正编业代", configured: false },
+  ]);
+  // 底图字段不是附件时快速失败，不返回误导性列表。
+  await assert.rejects(repo.listTemplateRows("source", "title"), { code: "INVALID_ASSET" });
+  const source = await repo.getTemplateSourceByRow("source", "s1", "image");
+  assert.deepEqual(source, {
+    tableId: "source",
+    tableName: "模板表",
+    recordId: "s1",
+    recordName: "正编业代",
+    backgroundFieldId: "image",
+  });
+  await assert.rejects(repo.getTemplateSourceByRow("source", "missing", "image"), {
+    code: "PLATFORM_ERROR",
+  });
+});
+
+test("未保存配置的模板行也读附件字段里的真实底图", async () => {
+  const mock = sourceFixture();
+  const repo = new FeishuPosterRepository(mock);
+  const source = await repo.getTemplateSourceByRow("source", "s1", "image");
+  // 该行还没有保存过配置，但底图仍必须来自模板行的附件字段。
+  assert.equal(await repo.loadSourceTemplate(source), null);
+  const asset = await repo.loadSourceBackground(source);
+  assert.equal(asset.name, "相同文件名.png");
+  assert.equal(asset.mimeType, "image/png");
+  assert.deepEqual(new Uint8Array(await asset.blob.arrayBuffer()), PNG_BYTES);
+  // 附件为空时快速失败，让用户补齐，不静默回落到示例底图。
+  mock.source.rows.set("s1", { title: "正编业代", image: [] });
+  await assert.rejects(repo.loadSourceBackground(source), { code: "INVALID_ASSET" });
+});
+
+test("模板行保存配置后列表标记为已配置，坏配置只标该行未配置", async () => {
+  const mock = sourceFixture();
+  const repo = new FeishuPosterRepository(mock);
+  const source = await repo.getTemplateSourceByRow("source", "s1", "image");
+  await repo.saveSourceTemplate(source, { ...bundle(), template: { ...bundle().template } });
+  const configField = mock.source.fields.find((field) => field.name === SOURCE_CONFIG_FIELD)!.id;
+  mock.source.rows.set("s2", {
+    title: "坏配置行",
+    image: [],
+    [configField]: [{ type: "text", text: "{不是 JSON" }],
+  });
+  assert.deepEqual(
+    await repo
+      .listTemplateRows("source", "image")
+      .then((rows) => rows.map((row) => [row.label, row.configured])),
+    [
+      ["正编业代", true],
+      ["坏配置行", false],
+    ],
+  );
 });
