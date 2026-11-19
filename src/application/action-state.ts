@@ -29,9 +29,21 @@ export function resolvePosterActionState(input: PosterActionStateInput) {
             : !input.hasOutputField
               ? "请选择要写入的附件字段"
               : "";
+  const canSave = ready && !sourceError && (!input.usesRecordBackground || input.hasRecord);
   return {
     editorDisabled: !ready,
-    canSave: ready && !sourceError && (!input.usesRecordBackground || input.hasRecord),
+    canSave,
+    saveBlockerText: canSave
+      ? ""
+      : !input.hasTemplate
+        ? "模板尚未就绪"
+        : input.sourceLoading
+          ? "正在读取底图来源模板"
+          : input.busy
+            ? "另一项操作正在执行"
+            : sourceError
+              ? sourceError
+              : "请先选择一条主记录",
     canPreview,
     canWriteCurrent,
     canWriteBatch: canWriteCurrent && input.recordCount > 0,

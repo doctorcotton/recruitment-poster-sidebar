@@ -154,3 +154,77 @@ test("导入拒绝中央目录低报原始尺寸的素材", async () => {
     await assert.rejects(parseTemplatePackage(new Blob([archive])), /ZIP 文件大小不一致/);
   }
 });
+
+// 浏览器端模板包走 Worker 消息通道，Node 里用假 Worker 全局还原这条路径。
+interface FakePackageWorker {
+  onmessage: ((event: { data: unknown }) => void) | null;
+  onerror: ((event: { message?: string }) => void) | null;
+  onmessageerror: ((event: unknown) => void) | null;
+  terminated: boolean;
+  postMessage(): void;
+  terminate(): void;
+}
+
+function installFakeWorker(reply: (worker: FakePackageWorker) => void): FakePackageWorker[] {
+  const created: FakePackageWorker[] = [];
+  class Impl implements FakePackageWorker {
+    onmessage: ((event: { data: unknown }) => void) | null = null;
+    onerror: ((event: { message?: string }) => void) | null = null;
+    onmessageerror: ((event: unknown) => void) | null = null;
+    terminated = false;
+    constructor() {
+      created.push(this);
+    }
+    postMessage(): void {
+      const worker = this;
+      queueMicrotask(() => reply(worker));
+    }
+    terminate(): void {
+      this.terminated = true;
+    }
+  }
+  (globalThis as { Worker?: unknown }).Worker = Impl;
+  return created;
+}
+
+function uninstallFakeWorker(): void {
+  delete (globalThis as { Worker?: unknown }).Worker;
+}
+
+test("模板包 Worker 通道成功返回结果，结束后终止 Worker", async () => {
+  const created = installFakeWorker((worker) =>
+    worker.onmessage?.({ data: { ok: true, result: "fake-zip" } }),
+  );
+  try {
+    const packed = await createTemplatePackage(bundle());
+    assert.equal(packed, "fake-zip" as unknown as Blob);
+    assert.equal(created.length, 1);
+    assert.ok(created[0].terminated);
+  } finally {
+    uninstallFakeWorker();
+  }
+});
+
+test("Worker 失败结果、加载错误、消息损坏统一映射为 PosterError", async () => {
+  const scenario = { kind: "fail" as "fail" | "load" | "corrupt" };
+  installFakeWorker((worker) => {
+    if (scenario.kind === "fail")
+      worker.onmessage?.({
+        data: { ok: false, code: "INVALID_TEMPLATE", message: "包体损坏" },
+      });
+    else if (scenario.kind === "load") worker.onerror?.({ message: "加载失败" });
+    else worker.onmessageerror?.({});
+  });
+  try {
+    await assert.rejects(createTemplatePackage(bundle()), {
+      code: "INVALID_TEMPLATE",
+      message: "包体损坏",
+    });
+    scenario.kind = "load";
+    await assert.rejects(parseTemplatePackage(new Blob()), { message: /Worker 加载失败/ });
+    scenario.kind = "corrupt";
+    await assert.rejects(parseTemplatePackage(new Blob()), { message: /无法读取/ });
+  } finally {
+    uninstallFakeWorker();
+  }
+});

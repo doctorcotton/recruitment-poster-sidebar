@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { OperationLock } from "../src/application/operation-lock";
 import { resolvePosterActionState } from "../src/application/action-state";
+import { hasUnsavedChanges } from "../src/application/draft-state";
 import {
   runBatchWrite,
   retryableBatchRows,
@@ -78,6 +79,13 @@ test("动作状态集中返回来源加载、输出字段与记录数阻断原�
   assert.equal(noRecord.canPreview, false);
   assert.equal(noRecord.canWriteCurrent, false);
   assert.match(noRecord.writeBlockerText, /主记录/);
+  // 保存阻断文案与写入阻断文案各自独立成链，busy 与来源错误要有各自的提示。
+  const busySave = resolvePosterActionState({ ...base, busy: "写入中" });
+  assert.equal(busySave.canSave, false);
+  assert.equal(busySave.saveBlockerText, "另一项操作正在执行");
+  const sourceFail = resolvePosterActionState({ ...base, sourceError: "底图读取失败" });
+  assert.equal(sourceFail.canSave, false);
+  assert.equal(sourceFail.saveBlockerText, "底图读取失败");
 });
 
 test("乐观版本检查接受未变更和旧版零号修订，拒绝覆盖新修订", () => {
@@ -251,4 +259,79 @@ test("批量先固定附件版本，逐行取用素材；初始进度快照不�
   );
   assert.ok(snapshots[0].every((row) => row.status === "pending"));
   assert.ok(snapshots.at(-1)!.every((row) => row.status === "succeeded"));
+});
+
+test("跨表绑定的预检按绑定表判断字段有效性", async () => {
+  const fields = [...context.fields, { id: "job", name: "岗位", kind: "text" as const }];
+  const scopedContext: WorkspaceContext = { ...context, fields };
+  const templateTable = {
+    tableId: "tpl",
+    fields: [{ id: "duty", name: "职责", kind: "text" as const }],
+  };
+  const box = DEFAULT_TEMPLATE.boxes[0];
+  const crossBundle: TemplateBundle = {
+    ...bundle,
+    template: {
+      ...bundle.template,
+      boxes: [
+        { ...box, id: "data", fieldId: "job", fieldTableId: null },
+        { ...box, id: "template", fieldId: "duty", fieldTableId: "tpl" },
+      ],
+    },
+  };
+  const run = (template: TemplateBundle) =>
+    runBatchWrite(
+      [rows[0]],
+      scopedContext,
+      "out",
+      new AbortController().signal,
+      operations({ templateTable, prepareBundle: async () => template }),
+    );
+  assert.equal((await run(crossBundle))[0].status, "succeeded");
+  // 模板表字段失效：只有把模板表字段集算进来才会被发现。
+  const staleTemplate = {
+    ...crossBundle,
+    template: {
+      ...crossBundle.template,
+      boxes: [{ ...box, id: "template", fieldId: "missing", fieldTableId: "tpl" }],
+    },
+  };
+  const [stale] = await run(staleTemplate);
+  assert.equal(stale.status, "preflight_failed");
+  assert.match(stale.message ?? "", /已失效字段/);
+  // 绑定表与预期模板表不一致，同样不能放过。
+  const wrongTable = {
+    ...crossBundle,
+    template: {
+      ...crossBundle.template,
+      boxes: [{ ...box, id: "template", fieldId: "duty", fieldTableId: "other" }],
+    },
+  };
+  assert.equal((await run(wrongTable))[0].status, "preflight_failed");
+});
+
+test("浏览动作重设基线后不算未保存，只有真实编辑才拦截", () => {
+  const base = {
+    templateStamp: "snap",
+    baselineStamp: "snap",
+    outputFieldId: "out",
+    savedOutputFieldId: "out",
+  };
+  assert.equal(hasUnsavedChanges(base), false);
+  // 切换记录/数据表这类浏览动作：版式原样保留，基线重设为当前快照。
+  assert.equal(hasUnsavedChanges({ ...base, baselineStamp: "snap" }), false);
+  // 模板真的改过。
+  assert.equal(hasUnsavedChanges({ ...base, templateStamp: "edited" }), true);
+  // 输出字段改过。
+  assert.equal(hasUnsavedChanges({ ...base, outputFieldId: "other" }), true);
+  // 没有版式时不参与判定，避免挡住首屏。
+  assert.equal(
+    hasUnsavedChanges({
+      templateStamp: "",
+      baselineStamp: "",
+      outputFieldId: "a",
+      savedOutputFieldId: "b",
+    }),
+    false,
+  );
 });

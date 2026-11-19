@@ -1,6 +1,7 @@
 import {
   PosterError,
   type DataRecord,
+  type TableField,
   type TemplateBundle,
   type WorkspaceContext,
 } from "../domain/types";
@@ -25,6 +26,8 @@ export interface BatchRowResult {
 }
 
 export interface BatchWriteOperations {
+  /** 模板表字段集；跨表绑定的图层要靠它判断字段是否仍然有效。 */
+  templateTable?: { tableId: string; fields: TableField[] } | null;
   prepareBundle(row: DataRecord): Promise<TemplateBundle>;
   resolveBundle(row: DataRecord, bundle: TemplateBundle): Promise<TemplateBundle>;
   readOutputVersion(row: DataRecord): Promise<string>;
@@ -42,15 +45,18 @@ export function validateWriteBundle(
   bundle: TemplateBundle,
   context: WorkspaceContext,
   outputFieldId: string,
+  templateTable?: { tableId: string; fields: TableField[] } | null,
 ): void {
   const output = context.fields.find((field) => field.id === outputFieldId);
   if (!output || output.kind !== "attachment")
     throw new PosterError("INVALID_ASSET", "请选择有效的附件输出字段");
-  if (outputFieldId === bundle.template.backgroundFieldId)
-    throw new PosterError("INVALID_ASSET", "输出附件字段不能与底图字段相同");
-  const missing = bundle.template.boxes.filter(
-    (box) => box.fieldId && !context.fields.some((field) => field.id === box.fieldId),
-  );
+  // 图层可能绑数据表变量，也可能绑模板行文案，两张表的字段集都要参与失效判断。
+  const missing = bundle.template.boxes.filter((box) => {
+    if (!box.fieldId) return false;
+    if (!box.fieldTableId) return !context.fields.some((field) => field.id === box.fieldId);
+    if (box.fieldTableId !== templateTable?.tableId) return true;
+    return !templateTable.fields.some((field) => field.id === box.fieldId);
+  });
   if (missing.length)
     throw new PosterError(
       "INVALID_TEMPLATE",
@@ -157,7 +163,7 @@ export async function runBatchWrite(
     let bundle: TemplateBundle;
     try {
       bundle = await operations.prepareBundle(row);
-      validateWriteBundle(bundle, context, outputFieldId);
+      validateWriteBundle(bundle, context, outputFieldId, operations.templateTable);
     } catch (error) {
       if (signal.aborted) break;
       update(index, "preflight_failed", error);
