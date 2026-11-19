@@ -66,6 +66,11 @@ export function validateTemplate(value: unknown): PosterTemplate {
       id: boxId,
       label: string(item.label, "文本框名称"),
       fieldId: item.fieldId === null ? null : string(item.fieldId, "字段标识"),
+      ...(item.fieldTableId === undefined
+        ? {}
+        : {
+            fieldTableId: item.fieldTableId === null ? null : string(item.fieldTableId, "绑定表"),
+          }),
       text: string(item.text, "文本内容", true),
       x,
       y,
