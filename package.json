@@ -22,7 +22,8 @@
     "test:browser:matrix": "npm run test:browser && npm run test:browser:firefox && npm run test:browser:webkit",
     "verify:static": "npm run check:architecture && npm run check && npm run lint && npm run format:check && npm run test:coverage && npm run build && npm run check:budget",
     "verify": "npm run verify:static && npm run test:browser",
-    "pack": "npm run build && node scripts/pack.mjs"
+    "pack": "npm run build && node scripts/pack.mjs",
+    "publish:dist": "npm run build && node scripts/publish-dist.mjs"
   },
   "dependencies": {
     "@douyinfe/semi-icons": "^2.90.0",
