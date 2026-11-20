@@ -5,6 +5,7 @@ import { IconSave, IconDownload, IconUndo, IconRedo } from "@douyinfe/semi-icons
 import type {
   DataRecord,
   PosterAsset,
+  PosterRepository,
   PosterTemplate,
   TemplateBundle,
   TemplateSummary,
@@ -59,7 +60,7 @@ import { alignLayers, moveLayer, type LayerAlignment } from "./domain/layer-oper
 import { pruneTemplateAssets } from "./domain/template-assets";
 import { MAX_IMAGE_PIXELS, MAX_IMAGE_SIDE } from "./domain/limits";
 import { useOutputFiles } from "./features/records/useOutputFiles";
-import { useRecordBackground } from "./features/records/useRecordBackground";
+import { readRecordTemplate, useRecordBackground } from "./features/records/useRecordBackground";
 import { RecordPanel } from "./features/records/RecordPanel";
 import { RecordWorkspace } from "./features/records/RecordWorkspace";
 import { ReadOnlyPosterPreview } from "./features/records/ReadOnlyPosterPreview";
@@ -98,6 +99,17 @@ function downloadBlob(blob: Blob, name: string) {
   link.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
+
+async function loadDefaultSourceDraft(repository: PosterRepository, source: TemplateSource) {
+  let warning = "";
+  const background = repository.loadSourceBackground(source).catch((error) => {
+    warning = error instanceof Error ? error.message : "模板底图读取失败";
+    return null;
+  });
+  const bundle = await loadDefaultBundle(background);
+  return { bundle, warning };
+}
+
 /** 逐字段比较；并集覆盖新出现的可选键（如首次打开斜体）。 */
 function sameTextBox(a: TextBox, b: TextBox): boolean {
   const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
@@ -244,46 +256,52 @@ export default function App() {
     templateFieldId,
     templateBackgroundFieldId,
   ]);
-  const { templateSource, templateRecord, sourceKey, sourceError, sourceLoading } =
-    useRecordBackground({
-      repository,
-      context,
-      recordId,
-      locatorFieldId: templateFieldId,
-      backgroundFieldId: templateBackgroundFieldId,
-      backgroundKey,
-      prepareBundle: withPresetFonts,
-      onRestore: (loaded) => {
-        const stamp = JSON.stringify(loaded.template);
-        // 多条记录常共用同一模板行：画布内容本来就一致时只同步素材与基线，
-        // 不清空撤销栈、不把选中框拽回第一个框。
-        if (stamp !== templateStamp) {
-          setTemplate(loaded.template);
-          selectCanvasBox(loaded.template.boxes[0]?.id ?? null);
-          history.current = { undo: [], redo: [] };
-        }
-        setAssets(loaded.assets);
+  const {
+    templateSource,
+    templateRecord,
+    sourceKey,
+    sourceError,
+    sourceLoading,
+    adoptInitialRead,
+  } = useRecordBackground({
+    repository,
+    context,
+    recordId,
+    locatorFieldId: templateFieldId,
+    backgroundFieldId: templateBackgroundFieldId,
+    backgroundKey,
+    prepareBundle: withPresetFonts,
+    onRestore: (loaded) => {
+      const stamp = JSON.stringify(loaded.template);
+      // 多条记录常共用同一模板行：画布内容本来就一致时只同步素材与基线，
+      // 不清空撤销栈、不把选中框拽回第一个框。
+      if (stamp !== templateStamp) {
+        setTemplate(loaded.template);
+        selectCanvasBox(loaded.template.boxes[0]?.id ?? null);
+        history.current = { undo: [], redo: [] };
+      }
+      setAssets(loaded.assets);
+      setSavedStamp(stamp);
+      setTemplateRevision(loaded.revision ?? 0);
+    },
+    onNewSource: (next, warning) => {
+      // 新来源保留当前版式作为草稿，但底图和基线都换成该模板行的真实数据。
+      if (next) {
+        const stamp = JSON.stringify(next.template);
+        // 同一模板行的多条记录内容一致：不重建画布，保留选中图层与撤销栈。
+        if (stamp !== templateStamp) setTemplate(next.template);
+        setAssets(next.assets);
+        setTemplateRevision(null);
+        // 被动切换来源本身不是用户修改：以换底图后的版式为基线，只有后续真实编辑才算未保存。
         setSavedStamp(stamp);
-        setTemplateRevision(loaded.revision ?? 0);
-      },
-      onNewSource: (next, warning) => {
-        // 新来源保留当前版式作为草稿，但底图和基线都换成该模板行的真实数据。
-        if (next) {
-          const stamp = JSON.stringify(next.template);
-          // 同一模板行的多条记录内容一致：不重建画布，保留选中图层与撤销栈。
-          if (stamp !== templateStamp) setTemplate(next.template);
-          setAssets(next.assets);
-          setTemplateRevision(null);
-          // 被动切换来源本身不是用户修改：以换底图后的版式为基线，只有后续真实编辑才算未保存。
-          setSavedStamp(stamp);
-        } else {
-          setTemplateRevision(null);
-          setSavedStamp(templateStamp);
-        }
-        if (warning) setNotice({ kind: "warning", text: warning });
-      },
-      draftBundle: () => bundle,
-    });
+      } else {
+        setTemplateRevision(null);
+        setSavedStamp(templateStamp);
+      }
+      if (warning) setNotice({ kind: "warning", text: warning });
+    },
+    draftBundle: () => bundle,
+  });
   // 字段映射页与模板页共用同一份手选行草稿，编辑目标与保存目标保持一致。
   const inTemplateModule = workspacePage === "template" || workspacePage === "mapping";
   /** 正在编辑的模板行：模板模块用手选行，记录页用查找引用定位到的行。 */
@@ -318,7 +336,11 @@ export default function App() {
   const recordSourcePending =
     sourceLoading ||
     Boolean(
-      templateFieldId && templateBackgroundFieldId && sourceKey !== backgroundKey && !sourceError,
+      recordId &&
+      templateFieldId &&
+      templateBackgroundFieldId &&
+      sourceKey !== backgroundKey &&
+      !sourceError,
     );
   const sourcePending = inTemplateModule ? templatePageLoading : recordSourcePending;
   const actions = resolvePosterActionState({
@@ -490,13 +512,10 @@ export default function App() {
         setSavedStamp(JSON.stringify(loaded.template));
         setTemplateRevision(loaded.revision ?? 0);
       } else {
-        const initial = await withPresetFonts(await loadDefaultBundle());
+        const draft = await loadDefaultSourceDraft(repository, source);
         if (disposed) return;
-        // 未配置的模板行从默认版式开始，避免把上一行的版式静默存进这一行。
-        initial.template.id = `recruitment-${source.recordId}`;
-        // 版式用默认的，底图仍要取这一行附件字段里的真实图。
-        const draft = await withSourceBackground(repository, initial, source);
-        if (disposed) return;
+        // 未配置的模板行从默认版式开始，底图取当前行附件。
+        draft.bundle.template.id = `recruitment-${source.recordId}`;
         firstBoxId = draft.bundle.template.boxes[0]?.id ?? null;
         setTemplate(draft.bundle.template);
         setAssets(draft.bundle.assets);
@@ -615,21 +634,18 @@ export default function App() {
     if (!tableId || !configTableId || tableId === configTableId) return;
     // 字体体积最大也最先用得上：与后面的元数据、记录读取并行下载，不排在串行往返之后。
     prefetchPresetFont();
-    await run("open-table", async () => {
+    await run("open-table", async ({ details }) => {
+      const started = performance.now();
       // 业务表和配置表分别指定；只有用户明确选择"新建"才允许创建配置表。
       const storage = await repository.initializeStorage(
         configTableId === "__new__" ? undefined : configTableId,
       );
       repository.invalidate?.();
-      const [metadata, saved] = await Promise.all([
-        repository.loadContext(tableId, false),
-        repository.listTemplates(),
-      ]);
-      const [firstPage, settings] = await Promise.all([
-        // 首屏记录跟随当前视图：顺序与筛选都和用户在表格里看到的一致。
-        repository.listRecords(tableId, undefined, 50, metadata.viewId),
-        repository.loadSettings(tableId),
-      ]);
+      // 模板库和配置读取与记录分页并行，记录列表无需等它们返回。
+      const catalog = Promise.all([repository.listTemplates(), repository.loadSettings(tableId)]);
+      void catalog.catch(() => {});
+      const metadata = await repository.loadContext(tableId, false);
+      const firstPage = await repository.listRecords(tableId, undefined, 50, metadata.viewId);
       const workspace = {
         ...metadata,
         records: firstPage.records,
@@ -639,8 +655,10 @@ export default function App() {
       setContext(workspace);
       setTemplate(null);
       setAssets([]);
+      setTemplateFieldId("");
+      setTemplateBackgroundFieldId("");
+      setTemplateFields([]);
       setOutputFieldId("");
-      setTemplates(saved);
       setRecordId(workspace.selectedRecordId);
       setRecordPageToken(firstPage.pageToken);
       setRecordHasMore(firstPage.hasMore);
@@ -665,21 +683,13 @@ export default function App() {
       setSelectingTable(false);
       setWorkspacePage("records");
       setStarting(false);
+      details.recordsReadyMs = Math.round(performance.now() - started);
+      const [saved, settings] = await catalog;
+      setTemplates(saved);
       const savedTemplate =
         settings?.templateId && saved.some((item) => item.id === settings.templateId)
           ? settings.templateId
           : undefined;
-      const initial = await withPresetFonts(
-        savedTemplate ? await repository.loadTemplate(savedTemplate) : await loadDefaultBundle(),
-      );
-      if (!savedTemplate) initial.template.id = `recruitment-${workspace.tableId}`;
-      if (repository.mode === "feishu" && !savedTemplate) {
-        // 默认把“海报类型”这类查找引用当作模板入口，用户可在设置页改。
-        initial.template.boxes = initial.template.boxes.map((box) => ({
-          ...box,
-          fieldId: workspace.fields.find((field) => field.name === box.label)?.id ?? null,
-        }));
-      }
       // 区分「旧配置没有该键」与「用户明确选了不启用」：null 是显式关闭，不能被自动探测推翻。
       const locatorFieldId =
         settings && settings.templateFieldId !== undefined
@@ -699,26 +709,48 @@ export default function App() {
           )?.id ?? "";
         setTemplateFields(templateMetadata.fields);
       }
-      initial.template.backgroundFieldId = null;
-      if (!savedTemplate && repository.mode === "feishu" && locatorFieldId && backgroundFieldId) {
-        // 首次打开没有已保存版式，底图仍要取当前记录的模板行附件，不能停在示例图。
-        const currentRecordId = workspace.selectedRecordId;
-        if (currentRecordId) {
-          try {
-            const source = await repository.getTemplateSource(
-              currentRecordId,
-              locatorFieldId,
-              workspace.tableId,
-              backgroundFieldId,
-            );
-            const draft = await withSourceBackground(repository, initial, source);
-            initial.template = draft.bundle.template;
-            initial.assets = draft.bundle.assets;
-            if (draft.warning) setNotice({ kind: "warning", text: draft.warning });
-          } catch {
-            // 定位失败由记录页的来源提示统一呈现，这里保留示例底图继续启动。
-          }
+      const currentRecordId = workspace.selectedRecordId;
+      let initialSource: Awaited<ReturnType<typeof readRecordTemplate>> | null = null;
+      let initialSourceError = "";
+      if (currentRecordId && locatorFieldId && backgroundFieldId) {
+        const sourceStarted = performance.now();
+        try {
+          initialSource = await readRecordTemplate(
+            repository,
+            currentRecordId,
+            locatorFieldId,
+            workspace.tableId,
+            backgroundFieldId,
+          );
+        } catch (error) {
+          initialSourceError = error instanceof Error ? error.message : "模板来源读取失败";
         }
+        details.sourceReadyMs = Math.round(performance.now() - sourceStarted);
+      }
+
+      let initial: TemplateBundle;
+      if (initialSource?.saved) {
+        initial = await withPresetFonts(initialSource.saved);
+      } else if (savedTemplate) {
+        initial = await withPresetFonts(await repository.loadTemplate(savedTemplate));
+        initial.template.backgroundFieldId = null;
+        if (initialSource) {
+          const draft = await withSourceBackground(repository, initial, initialSource.source);
+          initial = draft.bundle;
+          if (draft.warning) setNotice({ kind: "warning", text: draft.warning });
+        }
+      } else {
+        const draft = initialSource
+          ? await loadDefaultSourceDraft(repository, initialSource.source)
+          : { bundle: await loadDefaultBundle(), warning: "" };
+        initial = draft.bundle;
+        initial.template.id = `recruitment-${workspace.tableId}`;
+        if (repository.mode === "feishu")
+          initial.template.boxes = initial.template.boxes.map((box) => ({
+            ...box,
+            fieldId: workspace.fields.find((field) => field.name === box.label)?.id ?? null,
+          }));
+        if (draft.warning) setNotice({ kind: "warning", text: draft.warning });
       }
       const targets = workspace.fields.filter((field) => field.kind === "attachment");
       // 旧配置里的目标缺失或失效时，由用户重新绑定，避免改写其他附件列。
@@ -738,25 +770,35 @@ export default function App() {
           },
           null,
         ));
-      setTemplateFieldId(locatorFieldId);
-      setTemplateBackgroundFieldId(backgroundFieldId);
       if (!restoring)
         await repository.saveWorkspaceBinding({
           schemaVersion: 1,
           tableId: workspace.tableId,
           storageTableId: storage.tableId,
         });
+      if (currentRecordId && locatorFieldId && backgroundFieldId)
+        adoptInitialRead(
+          JSON.stringify([workspace.tableId, currentRecordId, locatorFieldId, backgroundFieldId]),
+          workspace.fields,
+          initialSource,
+          initialSourceError,
+        );
+      setTemplateFieldId(locatorFieldId);
+      setTemplateBackgroundFieldId(backgroundFieldId);
       setTemplate(initial.template);
       setAssets(initial.assets);
       setSelectedId(initial.template.boxes[0]?.id ?? null);
       setOutputFieldId(output);
       setSavedOutputFieldId(output);
-      setTemplateRevision(initial.revision ?? null);
+      setTemplateRevision(
+        initialSource && !initialSource.saved ? null : (initial.revision ?? null),
+      );
       settingsRevision.current = currentSettings?.updatedAt ?? (currentSettings ? 0 : null);
       setSavedStamp(JSON.stringify(initial.template));
       history.current = { undo: [], redo: [] };
       setSelectedLayerIds(new Set());
       setOutputRevision((value) => value + 1);
+      details.templateReadyMs = Math.round(performance.now() - started);
     });
   }
   useEffect(
@@ -1890,7 +1932,7 @@ export default function App() {
                 ) : (
                   <ReadOnlyPosterPreview
                     renderer={renderer}
-                    bundle={record ? stageBundle : null}
+                    bundle={record && !recordSourcePending && !sourceError ? stageBundle : null}
                     values={values}
                     recordLabel={record?.label ?? ""}
                     templateName={template.name}

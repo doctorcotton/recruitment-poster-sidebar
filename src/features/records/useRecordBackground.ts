@@ -25,6 +25,26 @@ interface Options {
   draftBundle(): TemplateBundle | null;
 }
 
+export async function readRecordTemplate(
+  repository: PosterRepository,
+  recordId: string,
+  locatorFieldId: string,
+  tableId: string,
+  backgroundFieldId: string,
+) {
+  const source = await repository.getTemplateSource(
+    recordId,
+    locatorFieldId,
+    tableId,
+    backgroundFieldId,
+  );
+  const [recordValues, saved] = await Promise.all([
+    repository.loadTemplateRecord(source),
+    repository.loadSourceTemplate(source),
+  ]);
+  return { source, recordValues, saved };
+}
+
 /** 数据行经查找引用定位模板行；底图、配置和文案都跟着模板行走，共享一个请求代际。 */
 export function useRecordBackground(options: Options) {
   const { repository, context, recordId, locatorFieldId, backgroundFieldId, backgroundKey } =
@@ -37,11 +57,31 @@ export function useRecordBackground(options: Options) {
   const [sourceError, setSourceError] = useState("");
   const [sourceLoading, setSourceLoading] = useState(false);
   const sourceRequestSeq = useRef(0);
+  const initialRead = useRef<{ key: string; fields: WorkspaceContext["fields"] } | null>(null);
   const callbacks = useRef(options);
   callbacks.current = options;
 
+  function adoptInitialRead(
+    key: string,
+    fields: WorkspaceContext["fields"],
+    read: Pick<Awaited<ReturnType<typeof readRecordTemplate>>, "source" | "recordValues"> | null,
+    error: string,
+  ) {
+    // 工作区已经读过首条记录。下一次 effect 直接沿用这轮结果，切换或刷新再重新读取。
+    initialRead.current = { key, fields };
+    ++sourceRequestSeq.current;
+    setTemplateSource(read?.source ?? null);
+    setTemplateRecord(read?.recordValues ?? null);
+    setSourceKey(error ? "" : key);
+    setSourceError(error);
+    setSourceLoading(false);
+  }
+
   useEffect(() => {
     const requestSeq = ++sourceRequestSeq.current;
+    const initial = initialRead.current;
+    initialRead.current = null;
+    if (initial?.key === backgroundKey && initial.fields === fields) return;
     if (!locatorFieldId || !backgroundFieldId || !recordId || !fields || !tableId) {
       setSourceLoading(false);
       setTemplateSource(null);
@@ -61,7 +101,8 @@ export function useRecordBackground(options: Options) {
     const pending = (async () => {
       if (!locator || locator.kind !== "lookup" || !locator.refTableId)
         throw new Error("模板定位字段已失效，请重新选择查找引用字段");
-      const source = await repository.getTemplateSource(
+      const { source, recordValues, saved } = await readRecordTemplate(
+        repository,
         recordId,
         locatorFieldId,
         tableId,
@@ -69,12 +110,6 @@ export function useRecordBackground(options: Options) {
       );
       if (!current()) return;
       setTemplateSource(source);
-      // 行值与已保存配置互不依赖，并行读取可省掉一次串行往返。
-      const [recordValues, saved] = await Promise.all([
-        repository.loadTemplateRecord(source),
-        repository.loadSourceTemplate(source),
-      ]);
-      if (!current()) return;
       setTemplateRecord(recordValues);
       if (saved) {
         const loaded = await callbacks.current.prepareBundle(saved);
@@ -105,5 +140,12 @@ export function useRecordBackground(options: Options) {
     };
   }, [repository, tableId, fields, recordId, locatorFieldId, backgroundFieldId, backgroundKey]);
 
-  return { templateSource, templateRecord, sourceKey, sourceError, sourceLoading };
+  return {
+    templateSource,
+    templateRecord,
+    sourceKey,
+    sourceError,
+    sourceLoading,
+    adoptInitialRead,
+  };
 }

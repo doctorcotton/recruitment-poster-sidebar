@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { IDBFactory } from "fake-indexeddb";
 import {
   FeishuPosterRepository,
   SETTINGS_TABLE_NAME,
@@ -15,8 +17,11 @@ import {
   type SdkTable,
 } from "../src/data/feishu-repository";
 import { BACKGROUND_TIMEOUT_MS } from "../src/data/background-attachment";
+import { IndexedDbBackgroundCache } from "../src/data/background-cache";
 import { hashBlob, MAX_ASSET_BYTES } from "../src/data/assets";
 import { PlatformPosterError } from "../src/data/errors";
+import { parseConfig } from "../src/data/feishu/config";
+import { TITLE_PRESET_FONT } from "../src/data/preset-fonts";
 import type { TemplateBundle, WorkspaceBinding } from "../src/domain/types";
 import type { IField } from "@lark-base-open/js-sdk";
 
@@ -1326,18 +1331,29 @@ test("查找引用值唯一定位模板行，底图来自模板行附件，预�
   assert.equal(mock.state.tableExists, false);
 });
 
-test("切换记录时同一模板表的字段元数据只读一次，行数据变化立即可见", async () => {
+test("模板行值与配置共用在途行读取，完成或失败后重新读取宿主", async () => {
   const mock = sourceFixture();
   const repo = new FeishuPosterRepository(mock);
   mock.source.fieldMetaReads = 0;
   const source = await repo.getTemplateSource("r1", "posterType", "main", "image");
   // 定位时读一次模板表字段元数据，行值与配置共用这一份，不再各读一遍。
   assert.equal(mock.source.fieldMetaReads, 1);
-  await Promise.all([repo.loadTemplateRecord(source), repo.loadSourceTemplate(source)]);
+  const readBoth = () =>
+    [repo.loadTemplateRecord(source), repo.loadSourceTemplate(source)] as const;
+  const recordReads = mock.source.recordReads;
+  await Promise.all(readBoth());
   assert.equal(mock.source.fieldMetaReads, 1);
+  assert.equal(mock.source.recordReads, recordReads + 1);
+  mock.source.readbackError = { code: 10214997 };
+  await Promise.all(
+    readBoth().map((pending) => assert.rejects(pending, { code: "PERMISSION_DENIED" })),
+  );
+  assert.equal(mock.source.recordReads, recordReads + 2);
+  mock.source.readbackError = undefined;
   // 行数据保持直读：模板行在飞书里被改动后，下一次读取要能看到新内容。
   mock.source.rows.set("s1", { title: "改过的类型", image: [] });
   assert.equal((await repo.loadTemplateRecord(source)).values.title, "改过的类型");
+  assert.equal(mock.source.recordReads, recordReads + 3);
 });
 
 test("不同记录命中同一模板行时只定位一次、底图只下载一次", async () => {
@@ -1355,6 +1371,84 @@ test("不同记录命中同一模板行时只定位一次、底图只下载一�
   // 模板行相同 → 附件快照相同 → 只申请一次临时地址、下载一次字节。
   assert.equal(mock.source.urlTokenCalls.length, 1);
   assert.equal(mock.fetchUrls.length, 1);
+});
+
+test("重开边栏复用底图字节，附件换代、权限变化和换 Base 使用当前快照", async () => {
+  const mock = sourceFixture();
+  const factory = new IDBFactory();
+  const open = async () => {
+    const repo = new FeishuPosterRepository({
+      ...mock,
+      backgroundCache: new IndexedDbBackgroundCache(factory),
+    });
+    await repo.loadContext("main", false);
+    return repo;
+  };
+  const first = await open();
+  const source = await first.getTemplateSource("r1", "posterType", "main", "image");
+  const initial = await first.loadSourceBackground(source);
+  assert.equal(mock.fetchUrls.length, 1);
+
+  const reopened = await open();
+  const restored = await reopened.loadSourceBackground(source);
+  assert.equal(restored.id, initial.id);
+  assert.deepEqual(new Uint8Array(await restored.blob.arrayBuffer()), PNG_BYTES);
+  assert.equal(mock.fetchUrls.length, 1);
+  assert.equal(mock.source.urlTokenCalls.length, 2);
+
+  const readUrls = mock.source.getCellAttachmentUrls.bind(mock.source);
+  mock.source.getCellAttachmentUrls = async () => {
+    throw { code: 10214997 };
+  };
+  await assert.rejects((await open()).loadSourceBackground(source), { code: "PERMISSION_DENIED" });
+  assert.equal(mock.fetchUrls.length, 1);
+  mock.source.getCellAttachmentUrls = readUrls;
+
+  const row = mock.source.rows.get("s1")!;
+  row.image = [
+    {
+      ...mock.attachment,
+      token: "new-image",
+      type: "image/jpeg",
+      size: JPEG_BYTES.length,
+    },
+  ];
+  mock.uploads.set("new-image", new File([JPEG_BYTES], "相同文件名.jpg", { type: "image/jpeg" }));
+  const changed = await reopened.loadSourceBackground(source);
+  assert.notEqual(changed.id, initial.id);
+  assert.equal(mock.fetchUrls.length, 2);
+  assert.equal((await (await open()).loadSourceBackground(source)).id, changed.id);
+  assert.equal(mock.fetchUrls.length, 2);
+
+  mock.state.baseId = "base-2";
+  await reopened.loadContext("main", false);
+  await reopened.loadSourceBackground(source);
+  assert.equal(mock.fetchUrls.length, 3);
+});
+
+test("独立模板库重开边栏只复用底图，自定义字体继续从飞书读取", async () => {
+  const mock = mockSdk();
+  const factory = new IDBFactory();
+  const open = async () => {
+    const repo = new FeishuPosterRepository({
+      ...mock,
+      backgroundCache: new IndexedDbBackgroundCache(factory),
+    });
+    await repo.loadContext("main", false);
+    return repo;
+  };
+  const first = await open();
+  const expected = bundle();
+  await first.saveTemplate(expected);
+  await first.loadTemplate(expected.template.id);
+  assert.equal(mock.fetchUrls.length, 2);
+
+  const reopened = await open();
+  const loaded = await reopened.loadTemplate(expected.template.id);
+  assert.equal(await loaded.assets[0].blob.text(), "picture-v1");
+  assert.equal(await loaded.assets[1].blob.text(), "font-v1");
+  assert.equal(mock.fetchUrls.length, 3);
+  assert.match(mock.fetchUrls[2], /token-2/);
 });
 
 test("模板定位零匹配、多行同键、空引用值、缺少元数据与错误字段均不猜测", async () => {
@@ -1464,6 +1558,180 @@ test("来源配置仅显式保存时创建字段、上传字体，来源业务�
   mock.uploads.set(next.token, new File([JPEG_BYTES], "next.jpg"));
   assert.equal((await reopened.loadSourceTemplate(source))!.assets[0].mimeType, "image/jpeg");
   assert.equal(mock.state.tableExists, false);
+});
+
+test("旧模板读取内置字体附件并兼容重存，同名同大小的自定义字体仍上传", async (t) => {
+  const mock = sourceFixture();
+  const repo = new FeishuPosterRepository(mock);
+  const source = await repo.getTemplateSource("r1", "posterType", "main", "image");
+  const bytes = new Uint8Array(
+    await readFile(new URL("../public/fonts/YouSheBiaoTiHei.woff2", import.meta.url)),
+  );
+  t.mock.method(globalThis, "fetch", async (input: RequestInfo | URL) => {
+    assert.equal(String(input), `/fonts/${TITLE_PRESET_FONT.file}`);
+    return new Response(bytes);
+  });
+  const expected = bundle();
+  const alias = "template-title-font";
+  expected.template.fontIds = [alias];
+  expected.template.boxes[0].fontId = alias;
+  const font = {
+    id: alias,
+    name: TITLE_PRESET_FONT.name,
+    mimeType: "font/woff2",
+    blob: new Blob([bytes], { type: "font/woff2" }),
+  };
+  expected.assets[1] = font;
+  const hash = await hashBlob(font.blob);
+  const oldFont = {
+    token: "old-preset",
+    name: font.name,
+    type: font.mimeType,
+    size: font.blob.size,
+    timeStamp: 1,
+  };
+  await mock.source.addField({ name: SOURCE_CONFIG_FIELD, type: 1 });
+  await mock.source.addField({ name: SOURCE_FONT_FIELD, type: 17 });
+  const configField = mock.source.fields.find((field) => field.name === SOURCE_CONFIG_FIELD)!.id;
+  const fontField = mock.source.fields.find((field) => field.name === SOURCE_FONT_FIELD)!.id;
+  const row = () => mock.source.rows.get("s1")!;
+  row()[configField] = JSON.stringify({
+    schemaVersion: 1,
+    template: expected.template,
+    assets: [
+      {
+        id: alias,
+        name: font.name,
+        mimeType: font.mimeType,
+        size: oldFont.size,
+        token: oldFont.token,
+        hash,
+      },
+    ],
+    updatedAt: 1,
+  });
+  row()[fontField] = [oldFont];
+
+  const loaded = (await repo.loadSourceTemplate(source))!;
+  assert.equal(await hashBlob(loaded.assets[1].blob), hash);
+  assert.equal(loaded.assets[1].id, alias);
+  assert.deepEqual(mock.source.urlTokenCalls, [[mock.attachment.token]]);
+  assert.equal(mock.source.setRecordCalls.length, 0);
+
+  // 即使本地有相同文件，模板中的附件引用仍必须有效。
+  row()[fontField] = [];
+  await assert.rejects(repo.loadSourceTemplate(source), { code: "INVALID_ASSET" });
+  row()[fontField] = [oldFont];
+  const revision = await repo.saveSourceTemplate(source, loaded, loaded.revision);
+  const saved = parseConfig(row()[configField]);
+  assert.equal(saved.schemaVersion, 2);
+  assert.equal(saved.assets[0].preset, "youshe-title-v1");
+  assert.equal(saved.assets[0].token, undefined);
+  assert.deepEqual(row()[fontField], []);
+  assert.deepEqual(row().image, [mock.attachment]);
+  assert.equal(mock.state.uploadCalls, 0);
+  assert.equal(await hashBlob((await repo.loadSourceTemplate(source))!.assets[1].blob), hash);
+
+  const changed = bytes.slice();
+  changed[0] ^= 1;
+  expected.assets[1] = { ...font, blob: new Blob([changed], { type: font.mimeType }) };
+  await repo.saveSourceTemplate(source, expected, revision);
+  const [uploaded] = row()[fontField] as SdkAttachment[];
+  assert.equal(mock.state.uploadCalls, 1);
+  const reloaded = (await repo.loadSourceTemplate(source))!;
+  assert.equal(await hashBlob(reloaded.assets[1].blob), await hashBlob(expected.assets[1].blob));
+  assert.equal(parseConfig(row()[configField]).schemaVersion, 1);
+  assert.deepEqual(mock.source.urlTokenCalls.at(-1), [uploaded.token]);
+});
+
+test("纯内置字体不建飞书字体列，独立模板库也只上传底图", async (t) => {
+  const mock = sourceFixture();
+  const repo = new FeishuPosterRepository(mock);
+  const source = await repo.getTemplateSourceByRow("source", "s1", "image");
+  const bytes = new Uint8Array(
+    await readFile(new URL("../public/fonts/YouSheBiaoTiHei.woff2", import.meta.url)),
+  );
+  t.mock.method(globalThis, "fetch", async () => new Response(bytes));
+  const expected = bundle();
+  expected.template.fontIds = [TITLE_PRESET_FONT.id];
+  expected.template.boxes[0].fontId = TITLE_PRESET_FONT.id;
+  expected.assets[1] = {
+    id: TITLE_PRESET_FONT.id,
+    name: TITLE_PRESET_FONT.name,
+    mimeType: "font/woff2",
+    blob: new Blob([bytes], { type: "font/woff2" }),
+  };
+  const revision = await repo.saveSourceTemplate(source, expected, null);
+  assert.deepEqual(
+    mock.source.addedFields.map((field) => field.name),
+    [SOURCE_CONFIG_FIELD],
+  );
+  assert.equal(mock.state.uploadCalls, 0);
+  assert.equal((await repo.loadSourceTemplate(source))!.assets[1].blob.size, bytes.length);
+
+  await repo.saveTemplate(expected, null);
+  const libraryRow = [...mock.templates.rows.values()][0];
+  const libraryConfig = parseConfig(libraryRow.config);
+  assert.equal(libraryConfig.schemaVersion, 2);
+  assert.equal(libraryConfig.assets[1].preset, "youshe-title-v1");
+  assert.equal(mock.state.uploadCalls, 1);
+  const loaded = await repo.loadTemplate(expected.template.id);
+  assert.equal(loaded.assets[1].blob.size, bytes.length);
+  assert.deepEqual(mock.templates.urlTokenCalls, [[libraryConfig.assets[0].token]]);
+
+  const custom = bundle().assets[1];
+  expected.template.fontIds.push(custom.id);
+  expected.assets.push(custom);
+  await repo.saveSourceTemplate(source, expected, revision);
+  const fontField = mock.source.fields.find((field) => field.name === SOURCE_FONT_FIELD)!.id;
+  const attachments = mock.source.rows.get("s1")![fontField] as SdkAttachment[];
+  assert.deepEqual(
+    attachments.map(({ name }) => name),
+    [custom.name],
+  );
+  assert.equal(mock.state.uploadCalls, 2);
+  const mixed = (await repo.loadSourceTemplate(source))!;
+  assert.deepEqual(mixed.template.fontIds, [TITLE_PRESET_FONT.id, custom.id]);
+  assert.equal(await mixed.assets[2].blob.text(), "font-v1");
+});
+
+test("模板底图与字体并行下载，同批字体仍逐个下载", async () => {
+  const mock = sourceFixture();
+  const repo = new FeishuPosterRepository(mock);
+  const source = await repo.getTemplateSource("r1", "posterType", "main", "image");
+  const expected = bundle();
+  expected.template.fontIds.push("font-2");
+  expected.assets.push({
+    ...expected.assets[1],
+    id: "font-2",
+    blob: new Blob(["font-v2"], { type: "font/otf" }),
+  });
+  await repo.saveSourceTemplate(source, expected);
+  const fontField = mock.source.fields.find((field) => field.name === SOURCE_FONT_FIELD)!.id;
+  const [firstFont, secondFont] = mock.source.rows.get("s1")![fontField] as SdkAttachment[];
+  let releaseFirstFont!: () => void;
+  const firstFontGate = new Promise<void>((resolve) => (releaseFirstFont = resolve));
+  const downloads: string[] = [];
+  const reopened = new FeishuPosterRepository({
+    ...mock,
+    fetcher: async (input, init) => {
+      const token = new URL(String(input)).pathname.slice(1);
+      downloads.push(token);
+      if (token === firstFont.token) await firstFontGate;
+      return mock.fetcher(input, init);
+    },
+  });
+  const pending = reopened.loadSourceTemplate(source);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const startedWhileFirstFontBlocked = [...downloads].sort();
+  releaseFirstFont();
+  const loaded = await pending;
+  assert.deepEqual(startedWhileFirstFontBlocked, [mock.attachment.token, firstFont.token].sort());
+  assert.equal(downloads.at(-1), secondFont.token);
+  assert.deepEqual(
+    loaded?.assets.slice(1).map((asset) => asset.id),
+    expected.template.fontIds,
+  );
 });
 
 test("其他窗口首次保存配置后，旧字段快照不能绕过修订检查或重复建列", async () => {
@@ -1894,16 +2162,31 @@ test("恢复固定表指针后反复初始化和配置读写只更新原业务�
   assert.equal(mock.state.tableExists, false);
 });
 
-test("配置表列表包含自建表与现有招聘海报配置，读取列表不新建表", async () => {
+test("业务表与存储表列表共用在途元数据，各自筛选且后续读取实时", async () => {
   const mock = storageFixture();
   const repo = new FeishuPosterRepository(mock);
   mock.state.settingsExist = true;
   mock.state.tableExists = true;
-  assert.deepEqual(await repo.listStorageTables(), [
+  const getTableMetaList = mock.sdk.base.getTableMetaList.bind(mock.sdk.base);
+  let metadataReads = 0;
+  mock.sdk.base.getTableMetaList = () => {
+    metadataReads++;
+    return getTableMetaList();
+  };
+  const [tables, storageTables] = await Promise.all([repo.listTables(), repo.listStorageTables()]);
+  assert.deepEqual(tables, [
+    { id: "main", name: mock.main.name },
+    { id: mock.custom.id, name: mock.custom.name },
+  ]);
+  assert.deepEqual(storageTables, [
     { id: "main", name: mock.main.name },
     { id: "settings", name: SETTINGS_TABLE_NAME },
     { id: mock.custom.id, name: mock.custom.name },
   ]);
+  assert.equal(metadataReads, 1);
+  mock.state.settingsExist = false;
+  assert.deepEqual(await repo.listStorageTables(), tables);
+  assert.equal(metadataReads, 2);
   assert.equal(mock.tableCreations(), 0);
 });
 

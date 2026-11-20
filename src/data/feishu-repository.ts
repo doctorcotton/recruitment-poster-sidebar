@@ -18,13 +18,25 @@ import {
 } from "../domain/types";
 import { hashBlob, MAX_ASSET_BYTES } from "./assets";
 import { downloadAttachment, downloadBackground } from "./background-attachment";
+import {
+  IndexedDbBackgroundCache,
+  type BackgroundCache,
+  type CachedBackground,
+} from "./background-cache";
+import { identifyPresetFont, loadReferencedPresetFont, reuseSavedPresetFont } from "./preset-fonts";
 import { platformError } from "./errors";
 import { normalizeSettings, normalizeWorkspaceBinding, validateBundle } from "./validation";
 import { RequestCache, type RequestCacheOptions } from "./request-cache";
 import { assertRevisionUnchanged, nextRevision } from "./revisions";
 import type { IAddTableConfig, IAttachmentField } from "@lark-base-open/js-sdk";
 import { backgroundAttachment, cellText, FIELD_TYPES, lookupKey, richText } from "./feishu/values";
-import { parseConfig, type SavedAsset, type SavedConfig } from "./feishu/config";
+import {
+  buildSavedConfig,
+  isSavedAttachment,
+  parseConfig,
+  type SavedAsset,
+  type SavedConfig,
+} from "./feishu/config";
 import {
   readAllRecords,
   readRecordPage,
@@ -74,6 +86,12 @@ export interface FeishuRepositoryOptions extends RequestCacheOptions {
   sdk?: FeishuSdkFacade;
   loadSdk?: () => Promise<FeishuSdkFacade>;
   fetcher?: typeof fetch;
+  backgroundCache?: BackgroundCache;
+}
+
+interface AssetScope {
+  assetCache: RequestCache;
+  baseId: string | null | undefined;
 }
 
 interface TemplateTable {
@@ -101,6 +119,46 @@ interface SdkScope {
 // 同一宿主 SDK 共享一个写入边界，避免两个边栏仓储重复建表、建模板或同时上传。
 const sdkScopes = new WeakMap<FeishuSdkFacade, SdkScope>();
 
+function attachmentTokens(value: unknown): string[] {
+  return (Array.isArray(value) ? value : []).flatMap((item) =>
+    item && typeof item === "object" && typeof item.token === "string" ? [item.token] : [],
+  );
+}
+
+function attachmentCell(assets: SavedAsset[], updatedAt: number): SdkAttachment[] {
+  const entries = assets.filter(isSavedAttachment).map(
+    (asset) =>
+      [
+        asset.token,
+        {
+          token: asset.token,
+          name: asset.name,
+          type: asset.mimeType,
+          size: asset.size,
+          timeStamp: updatedAt,
+        },
+      ] as const,
+  );
+  return [...new Map(entries).values()];
+}
+
+function confirmsAttachments(value: unknown, expected: SdkAttachment[]): boolean {
+  const tokens = new Set(attachmentTokens(value));
+  return tokens.size === expected.length && expected.every(({ token }) => tokens.has(token));
+}
+
+function sharePendingRead<T>(
+  reads: Map<string, Promise<unknown>>,
+  key: string,
+  load: () => Promise<T>,
+): Promise<T> {
+  const pending = reads.get(key);
+  if (pending) return pending as Promise<T>;
+  const request = load().finally(() => reads.delete(key));
+  reads.set(key, request);
+  return request;
+}
+
 async function loadDefaultSdk(): Promise<FeishuSdkFacade> {
   // 动态导入延迟到首次仓储调用，本地模式和组件构造均不触发宿主握手。
   const { bitable } = await import("@lark-base-open/js-sdk");
@@ -119,15 +177,25 @@ export class FeishuPosterRepository implements PosterRepository {
   private configuredSettingsTableId?: string;
   private baseId?: string | null;
   private cache: RequestCache;
+  private pendingReads = new Map<string, Promise<unknown>>();
   /**
    * 附件字节常驻缓存：键里已经带上附件快照（token / 大小 / 时间戳）或内容哈希，
    * 同一份字节永远是对的，因此不受 TTL 与“保存后失效”影响，
    * 只由 LRU 的条目数与字节上限淘汰。切走再切回同一模板行不会重新下载。
    */
   private assetCache: RequestCache;
+  private readonly backgroundCache?: BackgroundCache;
+
   constructor(private readonly options: FeishuRepositoryOptions = {}) {
     this.cache = new RequestCache(options);
     this.assetCache = this.createAssetCache();
+    this.backgroundCache =
+      options.backgroundCache ??
+      (typeof indexedDB === "undefined" ? undefined : new IndexedDbBackgroundCache(indexedDB));
+  }
+
+  private captureAssetScope(): AssetScope {
+    return { assetCache: this.assetCache, baseId: this.baseId };
   }
 
   private createAssetCache(): RequestCache {
@@ -144,6 +212,7 @@ export class FeishuPosterRepository implements PosterRepository {
   invalidate(): void {
     this.cache.invalidate();
     this.cache = new RequestCache(this.options);
+    this.pendingReads = new Map();
   }
 
   /** 换 Base 时连素材一起丢：表 ID 跨 Base 可能重名，不能借用别的 Base 的字节。 */
@@ -229,16 +298,18 @@ export class FeishuPosterRepository implements PosterRepository {
   }
 
   listTables(): Promise<TableSummary[]> {
+    const reads = this.pendingReads;
     return this.run("读取业务表列表", async (sdk) =>
-      (await sdk.base.getTableMetaList())
+      (await sharePendingRead(reads, "tables", () => sdk.base.getTableMetaList()))
         .filter((table) => table.name !== SETTINGS_TABLE_NAME && table.name !== TEMPLATE_TABLE_NAME)
         .map((table) => ({ id: table.id, name: table.name })),
     );
   }
 
   listStorageTables(): Promise<TableSummary[]> {
+    const reads = this.pendingReads;
     return this.run("读取配置存储表列表", async (sdk) =>
-      (await sdk.base.getTableMetaList())
+      (await sharePendingRead(reads, "tables", () => sdk.base.getTableMetaList()))
         .filter((table) => table.name !== TEMPLATE_TABLE_NAME)
         .map((table) => ({ id: table.id, name: table.name })),
     );
@@ -375,12 +446,15 @@ export class FeishuPosterRepository implements PosterRepository {
     return cache.get(JSON.stringify(["field-meta", table.id]), () => table.getFieldMetaList());
   }
 
-  /**
-   * 行数据始终直读宿主：底图、文案和配置都可能被其他人改动，
-   * 缓存会让人看不到变化。省下的往返由调用方并行读取完成。
-   */
-  private templateRow(table: SdkTable, recordId: string): ReturnType<SdkTable["getRecordById"]> {
-    return table.getRecordById(recordId);
+  /** 模板行的并发读取共用一次宿主请求，结束后重新读取最新数据。 */
+  private templateRow(
+    table: SdkTable,
+    recordId: string,
+    reads: Map<string, Promise<unknown>>,
+  ): ReturnType<SdkTable["getRecordById"]> {
+    return sharePendingRead(reads, JSON.stringify([table.id, recordId]), () =>
+      table.getRecordById(recordId),
+    );
   }
 
   listRecords(
@@ -398,9 +472,10 @@ export class FeishuPosterRepository implements PosterRepository {
   }
 
   loadBackground(recordId: string, fieldId: string, tableId: string): Promise<PosterAsset> {
-    const { cache, assetCache } = this;
+    const cache = this.cache;
+    const scope = this.captureAssetScope();
     return this.run("读取行底图", (sdk) =>
-      this.readBackground(sdk, recordId, fieldId, tableId, cache, assetCache),
+      this.readBackground(sdk, recordId, fieldId, tableId, cache, scope),
     );
   }
 
@@ -410,12 +485,12 @@ export class FeishuPosterRepository implements PosterRepository {
     fieldId: string,
     tableId: string,
     cache: RequestCache,
-    assetCache: RequestCache,
+    scope: AssetScope,
   ): Promise<PosterAsset> {
     const table = await sdk.base.getTableById(tableId);
     const [fields, record] = await Promise.all([
       this.fieldMeta(table, cache),
-      this.templateRow(table, recordId),
+      table.getRecordById(recordId),
     ]);
     const field = fields.find((item) => item.id === fieldId);
     if (field?.type !== FIELD_TYPES.attachment && field?.type !== FIELD_TYPES.lookup) {
@@ -426,8 +501,22 @@ export class FeishuPosterRepository implements PosterRepository {
       recordId,
       fieldId,
       backgroundAttachment(record.fields[fieldId]),
-      assetCache,
+      scope,
     );
+  }
+
+  private async readCachedBackground(
+    key: string | undefined,
+    readUrl: () => Promise<string>,
+    download: (url: string) => Promise<CachedBackground>,
+  ): Promise<CachedBackground> {
+    const lookup = key ? this.backgroundCache?.get(key) : undefined;
+    // 重开边栏后先向飞书确认当前附件仍可访问，再使用已缓存的字节。
+    const [url, cached] = await Promise.all([readUrl(), lookup]);
+    if (cached) return cached;
+    const asset = await download(url);
+    if (key) await this.backgroundCache?.put(key, asset);
+    return asset;
   }
 
   private async downloadRecordBackground(
@@ -435,25 +524,31 @@ export class FeishuPosterRepository implements PosterRepository {
     recordId: string,
     fieldId: string,
     attachment: SdkAttachment,
-    assetCache: RequestCache,
+    scope: AssetScope,
   ): Promise<PosterAsset> {
-    // 用当前记录的附件快照定位字节，命中时无需向宿主申请临时 URL。
-    const asset = await assetCache.get(
-      JSON.stringify([
-        "background",
-        table.id,
-        recordId,
-        fieldId,
-        attachment.token,
-        attachment.size,
-        attachment.timeStamp,
-      ]),
-      async () => {
-        const urls = await table.getCellAttachmentUrls([attachment.token], fieldId, recordId);
-        if (urls.length !== 1 || !urls[0])
-          throw new PosterError("INVALID_ASSET", "当前行底图附件的临时下载地址缺失。");
-        return downloadBackground(urls[0], attachment.name, this.options.fetcher);
-      },
+    const key = JSON.stringify([
+      "background",
+      scope.baseId,
+      table.id,
+      recordId,
+      fieldId,
+      attachment.token,
+      attachment.size,
+      attachment.type,
+      attachment.timeStamp,
+    ]);
+    // 同一边栏内命中内存后，连临时 URL 都不用重新申请。
+    const asset = await scope.assetCache.get(key, () =>
+      this.readCachedBackground(
+        scope.baseId ? key : undefined,
+        async () => {
+          const urls = await table.getCellAttachmentUrls([attachment.token], fieldId, recordId);
+          if (urls.length !== 1 || !urls[0])
+            throw new PosterError("INVALID_ASSET", "当前行底图附件的临时下载地址缺失。");
+          return urls[0];
+        },
+        (url) => downloadBackground(url, attachment.name, this.options.fetcher),
+      ),
     );
     return { ...asset, name: attachment.name };
   }
@@ -534,26 +629,27 @@ export class FeishuPosterRepository implements PosterRepository {
   }
 
   loadSourceBackground(source: TemplateSource): Promise<PosterAsset> {
-    const { cache, assetCache } = this;
+    const { cache, pendingReads } = this;
+    const scope = this.captureAssetScope();
     return this.run("读取模板底图", async (sdk) => {
-      const { table, attachment } = await this.sourceTarget(sdk, source, cache);
+      const { table, attachment } = await this.sourceTarget(sdk, source, { cache, pendingReads });
       return this.downloadRecordBackground(
         table,
         source.recordId,
         source.backgroundFieldId,
         attachment,
-        assetCache,
+        scope,
       );
     });
   }
 
   loadTemplateRecord(source: TemplateSource): Promise<TemplateRecordValues> {
-    const cache = this.cache;
+    const { cache, pendingReads } = this;
     return this.run("读取模板行", async (sdk) => {
       const table = await sdk.base.getTableById(source.tableId);
       const [fields, record] = await Promise.all([
         this.fieldMeta(table, cache),
-        this.templateRow(table, source.recordId),
+        this.templateRow(table, source.recordId, pendingReads),
       ]);
       const tableFields = fields.map(toTableField);
       const { values } = toDataRecord(
@@ -594,7 +690,7 @@ export class FeishuPosterRepository implements PosterRepository {
       const table = await sdk.base.getTableById(templateTableId);
       const [fields, record, tableName] = await Promise.all([
         this.fieldMeta(table, cache),
-        this.templateRow(table, recordId),
+        table.getRecordById(recordId),
         table.getName(),
       ]);
       this.assertTemplateBackgroundField(fields, backgroundFieldId);
@@ -618,12 +714,19 @@ export class FeishuPosterRepository implements PosterRepository {
     }
   }
 
-  private async sourceTarget(sdk: FeishuSdkFacade, source: TemplateSource, cache?: RequestCache) {
+  private async sourceTarget(
+    sdk: FeishuSdkFacade,
+    source: TemplateSource,
+    reads?: { cache: RequestCache; pendingReads: Map<string, Promise<unknown>> },
+  ) {
     const table = await sdk.base.getTableById(source.tableId);
     // 读取可以复用字段缓存；写入先确认最新列，再读取行内的修订号。
-    const [fields, record] = cache
-      ? await Promise.all([this.fieldMeta(table, cache), this.templateRow(table, source.recordId)])
-      : [await table.getFieldMetaList(), await this.templateRow(table, source.recordId)];
+    const [fields, record] = reads
+      ? await Promise.all([
+          this.fieldMeta(table, reads.cache),
+          this.templateRow(table, source.recordId, reads.pendingReads),
+        ])
+      : [await table.getFieldMetaList(), await table.getRecordById(source.recordId)];
     if (
       !fields.some(
         (field) => field.id === source.backgroundFieldId && field.type === FIELD_TYPES.attachment,
@@ -662,30 +765,75 @@ export class FeishuPosterRepository implements PosterRepository {
     return id;
   }
 
+  private async prepareSavedAssets(
+    sdk: FeishuSdkFacade,
+    assets: PosterAsset[],
+    reusable: Map<string, string>,
+  ): Promise<SavedAsset[]> {
+    const manifest: SavedAsset[] = [];
+    for (const asset of assets) {
+      const metadata = {
+        id: asset.id,
+        name: asset.name,
+        mimeType: asset.mimeType,
+        size: asset.blob.size,
+        hash: await hashBlob(asset.blob),
+      };
+      const preset = identifyPresetFont(metadata);
+      if (preset) {
+        manifest.push({ ...metadata, preset });
+        continue;
+      }
+      let token = reusable.get(metadata.hash);
+      if (!token) {
+        const uploaded = await sdk.base.batchUploadFile([
+          new File([asset.blob], asset.name, { type: asset.mimeType }),
+        ]);
+        token = uploaded[0];
+        if (uploaded.length !== 1 || !token)
+          throw new PosterError("PLATFORM_ERROR", "飞书未返回有效素材上传凭据。");
+        reusable.set(metadata.hash, token);
+      }
+      manifest.push({ ...metadata, token });
+    }
+    return manifest;
+  }
+
   private async loadSavedAssets(
     table: SdkTable,
     recordId: string,
-    fieldId: string,
+    fieldId: string | undefined,
     tokens: string[],
     manifest: SavedAsset[],
-    assetCache: RequestCache,
+    scope: AssetScope,
+    backgroundId?: string,
   ): Promise<PosterAsset[]> {
     const positions = new Map(tokens.map((token, i) => [token, i]));
     let urls: Promise<string[]> | undefined;
     const assets: PosterAsset[] = [];
     for (const asset of manifest) {
+      if (!isSavedAttachment(asset)) {
+        const blob = await loadReferencedPresetFont(asset.preset);
+        assets.push({ id: asset.id, name: asset.name, mimeType: asset.mimeType, blob });
+        continue;
+      }
       // 每次先核对当前单元格；只有缺少字节时才批量申请这一快照的 URL。
       const position = positions.get(asset.token);
-      if (position === undefined)
+      if (!fieldId || position === undefined)
         throw new PosterError("INVALID_ASSET", `模板素材“${asset.name}”附件已缺失。`);
       // 键含内容哈希：同一份字节在不同行、不同时间都直接复用。
-      const blob = await assetCache.get(
-        JSON.stringify(["asset", table.id, fieldId, asset.token, asset.hash, asset.mimeType]),
-        async () => {
+      const snapshot = [scope.baseId, table.id, fieldId, asset.token, asset.hash, asset.mimeType];
+      const blob = await scope.assetCache.get(JSON.stringify(["asset", ...snapshot]), async () => {
+        const preset = await reuseSavedPresetFont(asset);
+        if (preset) return preset;
+        const readUrl = async () => {
           urls ??= table.getCellAttachmentUrls(tokens, fieldId, recordId);
           const url = (await urls)[position];
           if (!url)
             throw new PosterError("INVALID_ASSET", `素材“${asset.name}”的临时下载地址缺失。`);
+          return url;
+        };
+        const download = async (url: string) => {
           const bytes = await downloadAttachment(
             url,
             this.options.fetcher,
@@ -693,24 +841,37 @@ export class FeishuPosterRepository implements PosterRepository {
           );
           if ((await hashBlob(bytes)) !== asset.hash)
             throw new PosterError("INVALID_ASSET", `模板素材“${asset.name}”与保存内容不一致。`);
-          // 缓存带 MIME 的 Blob，后续行可复用渲染器已解码的字体或图片。
           return bytes.slice(0, bytes.size, asset.mimeType);
-        },
-      );
+        };
+        if (asset.id === backgroundId && scope.baseId) {
+          const key = JSON.stringify(["saved-background", recordId, ...snapshot]);
+          const cached = await this.readCachedBackground(key, readUrl, async (url) => ({
+            id: asset.id,
+            mimeType: asset.mimeType,
+            blob: await download(url),
+          }));
+          return cached.blob;
+        }
+        return download(await readUrl());
+      });
       assets.push({ id: asset.id, name: asset.name, mimeType: asset.mimeType, blob });
     }
     return assets;
   }
 
   loadSourceTemplate(source: TemplateSource): Promise<TemplateBundle | null> {
-    const { cache, assetCache } = this;
+    const { cache, pendingReads } = this;
+    const scope = this.captureAssetScope();
     return this.run("读取模板行配置", async (sdk) => {
-      const { table, fields, record, attachment } = await this.sourceTarget(sdk, source, cache);
+      const { table, fields, record, attachment } = await this.sourceTarget(sdk, source, {
+        cache,
+        pendingReads,
+      });
       const { configField, fontField } = this.sourceColumns(fields);
       if (!configField || !cellText(record.fields[configField]).trim()) return null;
       const config = parseConfig(record.fields[configField]);
       if (
-        !fontField ||
+        (!fontField && config.assets.some(isSavedAttachment)) ||
         config.assets.length !== config.template.fontIds.length ||
         config.assets.some(
           (asset) =>
@@ -719,27 +880,17 @@ export class FeishuPosterRepository implements PosterRepository {
       ) {
         throw new PosterError("INVALID_ASSET", "模板行的字体附件清单不完整。");
       }
-      const value = record.fields[fontField];
-      const tokens = (Array.isArray(value) ? value : []).flatMap((item) =>
-        item && typeof item === "object" && "token" in item && typeof item.token === "string"
-          ? [item.token]
-          : [],
-      );
-      const assets = await this.loadSavedAssets(
-        table,
-        source.recordId,
-        fontField,
-        tokens,
-        config.assets,
-        assetCache,
-      );
-      const background = await this.downloadRecordBackground(
-        table,
-        source.recordId,
-        source.backgroundFieldId,
-        attachment,
-        assetCache,
-      );
+      const tokens = fontField ? attachmentTokens(record.fields[fontField]) : [];
+      const [assets, background] = await Promise.all([
+        this.loadSavedAssets(table, source.recordId, fontField, tokens, config.assets, scope),
+        this.downloadRecordBackground(
+          table,
+          source.recordId,
+          source.backgroundFieldId,
+          attachment,
+          scope,
+        ),
+      ]);
       const bundle = {
         template: { ...config.template, backgroundId: background.id },
         assets: [background, ...assets],
@@ -774,83 +925,44 @@ export class FeishuPosterRepository implements PosterRepository {
       const previousValue = columns.configField ? record.fields[columns.configField] : undefined;
       const previous = cellText(previousValue).trim() ? parseConfig(previousValue) : undefined;
       assertRevisionUnchanged(expectedUpdatedAt, previous?.updatedAt, "模板配置");
-      // 两列和版本均验证后再补缺字段，避免在已知冲突时修改用户表结构。
+      // 校验已有列与修订号后，只补这次写入所需的字段。
       const configField =
         columns.configField ??
         (await this.addSourceColumn(table, SOURCE_CONFIG_FIELD, FIELD_TYPES.text));
-      const fontField =
-        columns.fontField ??
-        (await this.addSourceColumn(table, SOURCE_FONT_FIELD, FIELD_TYPES.attachment));
-      const currentFonts = record.fields[fontField];
       const currentTokens = new Set(
-        (Array.isArray(currentFonts) ? currentFonts : []).flatMap((item) =>
-          item && typeof item === "object" && "token" in item ? [item.token] : [],
-        ),
+        columns.fontField ? attachmentTokens(record.fields[columns.fontField]) : [],
       );
       const reusable = new Map(
         previous?.assets
+          .filter(isSavedAttachment)
           .filter((asset) => currentTokens.has(asset.token))
           .map((asset) => [asset.hash, asset.token]),
       );
-      const assets: SavedAsset[] = [];
-      for (const font of fonts) {
-        const hash = await hashBlob(font.blob);
-        let token = reusable.get(hash);
-        if (!token) {
-          const uploaded = await sdk.base.batchUploadFile([
-            new File([font.blob], font.name, { type: font.mimeType }),
-          ]);
-          if (uploaded.length !== 1 || !uploaded[0])
-            throw new PosterError("PLATFORM_ERROR", "飞书未返回有效字体上传凭据。");
-          token = uploaded[0];
-          reusable.set(hash, token);
-        }
-        assets.push({
-          id: font.id,
-          name: font.name,
-          mimeType: font.mimeType,
-          size: font.blob.size,
-          token,
-          hash,
-        });
-      }
-      const config: SavedConfig = {
-        schemaVersion: 1,
-        template: bundle.template,
-        assets,
-        updatedAt: nextRevision(previous?.updatedAt),
-      };
+      const config = buildSavedConfig(
+        bundle.template,
+        await this.prepareSavedAssets(sdk, fonts, reusable),
+        nextRevision(previous?.updatedAt),
+      );
       const serialized = JSON.stringify(config);
-      const attachments: SdkAttachment[] = [
-        ...new Map(
-          assets.map((asset) => [
-            asset.token,
-            {
-              token: asset.token,
-              name: asset.name,
-              type: asset.mimeType,
-              size: asset.size,
-              timeStamp: config.updatedAt,
-            },
-          ]),
-        ).values(),
-      ];
-      // 只更新模板行的这两个单元格，绝不写回底图、查找引用或其他业务数据。
+      const attachments = attachmentCell(config.assets, config.updatedAt);
+      const fontField =
+        columns.fontField ??
+        (attachments.length
+          ? await this.addSourceColumn(table, SOURCE_FONT_FIELD, FIELD_TYPES.attachment)
+          : undefined);
+      // 只写模板配置及当前需保留的字体附件；纯内置字体的行无需增加附件列。
       const confirmedId = await table.setRecord(source.recordId, {
-        fields: { [configField]: richText(serialized), [fontField]: attachments },
+        fields: {
+          [configField]: richText(serialized),
+          ...(fontField ? { [fontField]: attachments } : {}),
+        },
       });
       if (!confirmedId || confirmedId !== source.recordId)
         throw new PosterError("PLATFORM_ERROR", "飞书未确认模板行写入成功。");
       const confirmed = await table.getRecordById(source.recordId);
-      const confirmedFonts = confirmed.fields[fontField];
-      const confirmedTokens = new Set(
-        (Array.isArray(confirmedFonts) ? confirmedFonts : []).flatMap((item) =>
-          item && typeof item === "object" && "token" in item ? [item.token] : [],
-        ),
-      );
       if (
         cellText(confirmed.fields[configField]) !== serialized ||
-        assets.some((asset) => !confirmedTokens.has(asset.token))
+        (fontField && !confirmsAttachments(confirmed.fields[fontField], attachments))
       ) {
         throw new PosterError(
           "PLATFORM_ERROR",
@@ -921,7 +1033,7 @@ export class FeishuPosterRepository implements PosterRepository {
   }
 
   loadTemplate(id: string): Promise<TemplateBundle> {
-    const assetCache = this.assetCache;
+    const scope = this.captureAssetScope();
     return this.run("读取模板", async (sdk) => {
       const target = await this.templateTable(sdk);
       const row =
@@ -936,7 +1048,8 @@ export class FeishuPosterRepository implements PosterRepository {
         target.assetField,
         tokens,
         row.config.assets,
-        assetCache,
+        scope,
+        row.config.template.backgroundId,
       );
       const bundle = { template: row.config.template, assets, revision: row.config.updatedAt };
       validateBundle(bundle);
@@ -958,59 +1071,18 @@ export class FeishuPosterRepository implements PosterRepository {
       const reusable = new Map<string, string>();
       for (const row of rows) {
         // 分页结果已经包含附件单元格，省去逐模板再读一次；新写入仍回读确认。
-        const tokens = new Set(
-          Array.isArray(row.attachments)
-            ? row.attachments.flatMap((item) =>
-                item && typeof item === "object" && "token" in item ? [item.token] : [],
-              )
-            : [],
-        );
+        const tokens = new Set(attachmentTokens(row.attachments));
         for (const asset of row.config.assets)
-          if (tokens.has(asset.token)) reusable.set(asset.hash, asset.token);
+          if (isSavedAttachment(asset) && tokens.has(asset.token))
+            reusable.set(asset.hash, asset.token);
       }
-      const assets: SavedAsset[] = [];
-      for (const asset of bundle.assets) {
-        const hash = await hashBlob(asset.blob);
-        let token = reusable.get(hash);
-        if (!token) {
-          const uploaded = await sdk.base.batchUploadFile([
-            new File([asset.blob], asset.name, { type: asset.mimeType }),
-          ]);
-          token = uploaded[0];
-          if (uploaded.length !== 1 || !token)
-            throw new PosterError("PLATFORM_ERROR", "飞书未返回有效素材上传凭据。");
-          reusable.set(hash, token);
-        }
-        assets.push({
-          id: asset.id,
-          name: asset.name,
-          mimeType: asset.mimeType,
-          size: asset.blob.size,
-          token,
-          hash,
-        });
-      }
-      const config: SavedConfig = {
-        schemaVersion: 1,
-        template: bundle.template,
-        assets,
-        updatedAt: nextRevision(existing?.config.updatedAt),
-      };
+      const config = buildSavedConfig(
+        bundle.template,
+        await this.prepareSavedAssets(sdk, bundle.assets, reusable),
+        nextRevision(existing?.config.updatedAt),
+      );
       const serialized = JSON.stringify(config);
-      const attachments: SdkAttachment[] = [
-        ...new Map(
-          assets.map((asset) => [
-            asset.token,
-            {
-              token: asset.token,
-              name: asset.name,
-              type: asset.mimeType,
-              size: asset.size,
-              timeStamp: config.updatedAt,
-            },
-          ]),
-        ).values(),
-      ];
+      const attachments = attachmentCell(config.assets, config.updatedAt);
       const value: SdkRecordInput = {
         fields: {
           [target.idField]: richText(bundle.template.id),
@@ -1030,10 +1102,7 @@ export class FeishuPosterRepository implements PosterRepository {
       ) {
         throw new PosterError("PLATFORM_ERROR", "模板写入后的配置校验失败，请重新读取模板确认。");
       }
-      const savedTokens = new Set(
-        ((await field.getValue(recordId)) ?? []).map((attachment) => attachment.token),
-      );
-      if (assets.some((asset) => !savedTokens.has(asset.token)))
+      if (!confirmsAttachments(await field.getValue(recordId), attachments))
         throw new PosterError("PLATFORM_ERROR", "模板写入后的素材校验失败。");
       return { id: config.template.id, name: config.template.name, updatedAt: config.updatedAt };
     });

@@ -1,29 +1,46 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { hashBlob } from "../src/data/assets";
 import {
   PRESET_FONT,
   TITLE_PRESET_FONT,
+  identifyPresetFont,
   loadDefaultBundle,
   loadPresetFontUpgrade,
+  loadReferencedPresetFont,
   loadTitlePresetFont,
   prefetchPresetFont,
   promotePresetFont,
+  reuseSavedPresetFont,
   withCompletePresetFont,
   withPresetFonts,
 } from "../src/data/preset-fonts";
 import { DEFAULT_TEMPLATE } from "../src/domain/defaults";
 import type { PosterAsset, TemplateBundle } from "../src/domain/types";
 
+const readFont = (file: string) =>
+  new Blob([readFileSync(new URL(`../public/fonts/${file}`, import.meta.url))], {
+    type: "font/woff2",
+  });
+const fullFont = readFont(PRESET_FONT.name);
+const fullTitleFont = readFont(TITLE_PRESET_FONT.file);
+const fontFingerprint = async (blob: Blob) => ({
+  mimeType: blob.type,
+  size: blob.size,
+  hash: await hashBlob(blob),
+});
+
 const requests: string[] = [];
-let titleFontAvailable = false;
+let titleFontResponse: Blob | undefined;
 const originalFetch = globalThis.fetch;
 const respond = (input: RequestInfo | URL) => {
   const url = String(input);
   requests.push(url);
   if (url.endsWith(PRESET_FONT.fastName)) return new Response("subset-bytes");
-  if (url.endsWith(PRESET_FONT.name)) return new Response("full-bytes");
-  if (url.endsWith(TITLE_PRESET_FONT.file) && titleFontAvailable)
-    return new Response("title-font-bytes");
+  if (url.endsWith(PRESET_FONT.name)) return new Response(fullFont);
+  if (url.endsWith(TITLE_PRESET_FONT.file) && titleFontResponse)
+    return new Response(titleFontResponse);
   if (url.endsWith("clean-background.webp")) return new Response("webp-bytes");
   if (url.endsWith("clean-background.png")) return new Response("png-bytes");
   return new Response("missing", { status: 404 });
@@ -68,10 +85,10 @@ test("完整字体到货后替换子集素材，名称与其余素材保持不�
   const subset = await loadDefaultBundle();
   assert.equal(await fontOf(subset).blob.text(), "subset-bytes");
   const full = await loadPresetFontUpgrade();
-  assert.equal(await full.blob.text(), "full-bytes");
+  assert.equal(full.blob.size, fullFont.size);
   const background = subset.assets[0];
   const upgraded = await withCompletePresetFont(subset);
-  assert.equal(await fontOf(upgraded).blob.text(), "full-bytes");
+  assert.equal(fontOf(upgraded).blob, full.blob);
   assert.equal(fontOf(upgraded).name, PRESET_FONT.name);
   assert.equal(upgraded.assets[0], background);
   // 幂等：已经是完整字体时返回同一个 bundle 对象，不触发多余重绘。
@@ -90,12 +107,26 @@ test("完整字体已到货后新模板直接挂完整字体", async (t) => {
     template: structuredClone(DEFAULT_TEMPLATE),
     assets: [],
   });
-  assert.equal(await fontOf(bundle).blob.text(), "full-bytes");
+  assert.equal(fontOf(bundle).blob.size, fullFont.size);
   assert.deepEqual(bundle.template.fontIds, [PRESET_FONT.id]);
   // 已有内置字体的模板不重复追加素材。
   const again = await withPresetFonts(bundle);
   assert.equal(again.assets.length, 1);
   t.diagnostic(`requests=${requests.length}`);
+});
+
+test("有模板行底图时直接建立默认版式，不请求示例底图", async () => {
+  const before = requests.length;
+  const background = {
+    id: "source-background",
+    name: "模板底图.webp",
+    mimeType: "image/webp",
+    blob: new Blob(["source-background"]),
+  };
+  const bundle = await loadDefaultBundle(Promise.resolve(background));
+  assert.equal(bundle.template.backgroundId, background.id);
+  assert.equal(bundle.assets[0], background);
+  assert.equal(requests.length, before);
 });
 
 test("启动预取只发一次请求，重复调用复用缓存", async () => {
@@ -105,15 +136,52 @@ test("启动预取只发一次请求，重复调用复用缓存", async () => {
   assert.equal(after, before);
 });
 
-test("优设标题黑按需加载，失败后可重试并复用成功结果", async () => {
+test("真实完整字体符合版本合同，子集和不匹配的清单不会被识别", async () => {
+  const before = requests.length;
+  const noto = await fontFingerprint(fullFont);
+  const youshe = await fontFingerprint(fullTitleFont);
+  assert.equal(identifyPresetFont(noto), "noto-bold-v1");
+  assert.equal(identifyPresetFont(youshe), "youshe-title-v1");
+  assert.equal(
+    identifyPresetFont(await fontFingerprint(readFont(PRESET_FONT.fastName))),
+    undefined,
+  );
+  assert.equal(identifyPresetFont({ ...noto, mimeType: "font/ttf" }), undefined);
+  assert.equal(identifyPresetFont({ ...noto, size: noto.size - 1 }), undefined);
+  assert.equal(await reuseSavedPresetFont({ ...noto, hash: youshe.hash }), undefined);
+  assert.equal(requests.length, before);
+});
+
+test("优设标题黑验证失败时允许旧模板回退，重试成功后与引用共用同一份字体", async () => {
   assert.equal(requests.filter((url) => url.endsWith(TITLE_PRESET_FONT.file)).length, 0);
-  await assert.rejects(loadTitlePresetFont(), { code: "FONT_LOAD_FAILED" });
-  titleFontAvailable = true;
+  const legacyAsset = {
+    ...(await fontFingerprint(fullTitleFont)),
+    id: "自定义素材 ID",
+    name: "优设标题黑副本.woff2",
+  };
+  await assert.rejects(loadReferencedPresetFont("youshe-title-v1"), { code: "FONT_LOAD_FAILED" });
+  // 字节数相同的损坏字体仍必须通过内容校验，旧模板应回退到原附件。
+  titleFontResponse = new Blob([fullTitleFont.slice(0, -1), new Uint8Array([0xff])]);
+  assert.notEqual(await hashBlob(titleFontResponse), legacyAsset.hash);
+  assert.equal(await reuseSavedPresetFont(legacyAsset), undefined);
+  titleFontResponse = fullTitleFont;
+  const reference = loadReferencedPresetFont("youshe-title-v1");
+  assert.equal(loadReferencedPresetFont("youshe-title-v1"), reference);
   const font = await loadTitlePresetFont();
   assert.equal(font.id, TITLE_PRESET_FONT.id);
   assert.equal(font.name, TITLE_PRESET_FONT.name);
   assert.equal(font.mimeType, "font/woff2");
-  assert.equal(await font.blob.text(), "title-font-bytes");
+  assert.equal(await reference, font.blob);
+  assert.equal(await reuseSavedPresetFont(legacyAsset), font.blob);
   assert.equal(await loadTitlePresetFont(), font);
-  assert.equal(requests.filter((url) => url.endsWith(TITLE_PRESET_FONT.file)).length, 2);
+  assert.equal(requests.filter((url) => url.endsWith(TITLE_PRESET_FONT.file)).length, 3);
+});
+
+test("旧版 Noto 附件可按内容复用已下载的完整字体", async () => {
+  const before = requests.length;
+  const font = await loadPresetFontUpgrade();
+  const legacyAsset = { ...(await fontFingerprint(fullFont)), id: "旧版 Noto 素材 ID" };
+  assert.equal(await reuseSavedPresetFont(legacyAsset), font.blob);
+  assert.equal(await loadReferencedPresetFont("noto-bold-v1"), font.blob);
+  assert.equal(requests.length, before);
 });
