@@ -289,7 +289,12 @@ try {
     assert.equal(preset.length, 1);
   });
   await check("默认首屏只有记录列表和只读海报，不暴露高级编辑", async () => {
-    await page.getByRole("heading", { name: "本地示例 · 门店伙伴", exact: true }).first().waitFor();
+    // 只读海报已去掉顶部标题栏，用 canvas 的 aria-label 确认渲染的是当前选中记录。
+    await page.locator("canvas.readonly-poster-canvas").waitFor({ state: "visible" });
+    assert.equal(
+      await page.locator("canvas.readonly-poster-canvas").getAttribute("aria-label"),
+      "本地示例 · 门店伙伴海报预览",
+    );
     assert.equal(await page.locator(".record-fields-panel").count(), 0);
     assert.equal(await page.locator(".record-field-row").count(), 0);
     assert.equal(await page.getByRole("button", { name: "保存模板", exact: true }).count(), 0);

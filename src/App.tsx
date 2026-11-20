@@ -2014,7 +2014,6 @@ export default function App() {
                     bundle={record && !recordSourcePending && !sourceError ? stageBundle : null}
                     values={values}
                     recordLabel={record?.label ?? ""}
-                    templateName={template.name}
                     placeholder={
                       sourceError || (recordId ? "正在读取当前行底图…" : "请选择一条记录")
                     }

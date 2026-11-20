@@ -7,7 +7,6 @@ interface Props {
   bundle: TemplateBundle | null;
   values: Record<string, string>;
   recordLabel: string;
-  templateName: string;
   placeholder?: string;
 }
 
@@ -17,7 +16,6 @@ export function ReadOnlyPosterPreview({
   bundle,
   values,
   recordLabel,
-  templateName,
   placeholder,
 }: Props) {
   const canvas = useRef<HTMLCanvasElement>(null);
@@ -59,14 +57,7 @@ export function ReadOnlyPosterPreview({
   }, [renderer, bundle, values]);
 
   return (
-    <section className="readonly-poster-card" aria-labelledby="readonly-poster-title">
-      <header className="readonly-poster-header">
-        <div>
-          <span className="record-eyebrow">当前记录海报</span>
-          <h2 id="readonly-poster-title">{recordLabel || "未选择记录"}</h2>
-        </div>
-        <span title="当前模板">{templateName}</span>
-      </header>
+    <section className="readonly-poster-card" aria-label="当前记录海报">
       <div className="readonly-poster-stage">
         {bundle ? (
           <>
