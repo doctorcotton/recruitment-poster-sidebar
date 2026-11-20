@@ -32,6 +32,8 @@ npm run pack
 
 `npm run pack` 输出 `output/poster-sidebar.zip`。通过 GitHub 提交飞书边栏插件时，将本次构建生成的整个 `dist/` 目录随源码一起提交，入口为 `dist/index.html`。CI 配置在 `.github/workflows/ci.yml`，静态门禁与三浏览器矩阵分开执行。
 
+发版走产物镜像仓 `recruitment-poster-sidebar-dist`：主仓历史带字体和旧产物，飞书市场 clone 会超时，镜像仓只含 `dist/` 与 `output` 声明。**推 `origin/main` 时 `.githooks/pre-push` 会自动构建、校验 `dist` 已入库并同步镜像仓**，不需要再手跑 `npm run publish:dist`。新克隆执行一次 `npm run hooks:install` 启用钩子。
+
 ## 工作区与记录
 
 - **默认记录工作台**：左栏选择多维表记录，中间按 `getFieldMetaList()` 返回顺序显示当前主记录的完整字段和值，右侧显示无选框、无拖拽的只读海报。首屏没有模板管理、图层或字段映射控件。
