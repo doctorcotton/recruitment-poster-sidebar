@@ -7,6 +7,5 @@ node_modules/
 .codebase-memory/
 artifacts/*
 !artifacts/loading-audit.json
-dist/
 output/
 .zcode/

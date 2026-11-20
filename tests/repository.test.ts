@@ -420,7 +420,7 @@ test("本地逐行底图通过可注入 fetch 读取真实示例字节，失败�
     (await repo.loadBackground("demo-1", "demo-background", "local-demo")).name,
     "clean-background.png",
   );
-  assert.deepEqual(urls, Array(2).fill("/demo/clean-background.png"));
+  assert.deepEqual(urls, Array(2).fill("./demo/clean-background.png"));
   for (const [record, field, table] of [
     ["missing", "demo-background", "local-demo"],
     ["demo-1", "poster", "local-demo"],

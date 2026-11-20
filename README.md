@@ -30,7 +30,7 @@ npm run check:budget
 npm run pack
 ```
 
-`npm run pack` 输出 `output/poster-sidebar.zip`。CI 配置在 `.github/workflows/ci.yml`，静态门禁与三浏览器矩阵分开执行。
+`npm run pack` 输出 `output/poster-sidebar.zip`。通过 GitHub 提交飞书边栏插件时，将本次构建生成的整个 `dist/` 目录随源码一起提交，入口为 `dist/index.html`。CI 配置在 `.github/workflows/ci.yml`，静态门禁与三浏览器矩阵分开执行。
 
 ## 工作区与记录
 

@@ -462,7 +462,7 @@ export class LocalPosterRepository implements PosterRepository {
       return cache
         .get("demo-background", () =>
           downloadBackground(
-            "/demo/clean-background.png",
+            "./demo/clean-background.png",
             "clean-background.png",
             this.options.fetcher,
           ),
@@ -478,7 +478,7 @@ export class LocalPosterRepository implements PosterRepository {
     return cache
       .get("demo-background", () =>
         downloadBackground(
-          "/demo/clean-background.png",
+          "./demo/clean-background.png",
           "clean-background.png",
           this.options.fetcher,
         ),
