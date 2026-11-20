@@ -7,6 +7,7 @@ import {
   runBatchWrite,
   retryableBatchRows,
   summarizeBatch,
+  describeBatchSummary,
   type BatchRowResult,
   type BatchWriteOperations,
 } from "../src/application/batch-write";
@@ -310,6 +311,39 @@ test("跨表绑定的预检按绑定表判断字段有效性", async () => {
   assert.equal((await run(wrongTable))[0].status, "preflight_failed");
 });
 
+test("模板表字段池没读到时报读取问题，不把正常图层引导成重绑", async () => {
+  const box = DEFAULT_TEMPLATE.boxes[0];
+  const templateBound: TemplateBundle = {
+    ...bundle,
+    template: {
+      ...bundle.template,
+      boxes: [{ ...box, id: "template", fieldId: "duty", fieldTableId: "tpl" }],
+    },
+  };
+  const run = (templateTable: BatchWriteOperations["templateTable"]) =>
+    runBatchWrite(
+      [rows[0]],
+      context,
+      "out",
+      new AbortController().signal,
+      operations({ templateTable, prepareBundle: async () => templateBound }),
+    );
+  // 没有模板表配置、或字段列表为空，都属于“没读到”，不能断言字段已失效。
+  for (const templateTable of [null, { tableId: "tpl", fields: [] }]) {
+    const [result] = await run(templateTable);
+    assert.equal(result.status, "preflight_failed");
+    assert.match(result.message ?? "", /模板表字段未读取完成/);
+    assert.doesNotMatch(result.message ?? "", /已失效字段/);
+  }
+  // 字段池读到了，缺字段才是真的需要重新绑定。
+  const [missing] = await run({
+    tableId: "tpl",
+    fields: [{ id: "other", name: "其他", kind: "text" }],
+  });
+  assert.equal(missing.status, "preflight_failed");
+  assert.match(missing.message ?? "", /已失效字段/);
+});
+
 test("浏览动作重设基线后不算未保存，只有真实编辑才拦截", () => {
   const base = {
     templateStamp: "snap",
@@ -333,5 +367,23 @@ test("浏览动作重设基线后不算未保存，只有真实编辑才拦截",
       savedOutputFieldId: "b",
     }),
     false,
+  );
+});
+
+test("结果摘要只列非零项，全成功时不堆一串 0", () => {
+  const base = {
+    total: 2,
+    done: 2,
+    succeeded: 2,
+    failed: 0,
+    conflict: 0,
+    unknown: 0,
+    stopped: 0,
+  };
+  assert.equal(describeBatchSummary(base), "成功 2");
+  assert.equal(describeBatchSummary({ ...base, succeeded: 1, failed: 1 }), "成功 1，失败 1");
+  assert.equal(
+    describeBatchSummary({ ...base, succeeded: 0, stopped: 5, conflict: 1 }),
+    "成功 0，冲突 1，停止 5",
   );
 });

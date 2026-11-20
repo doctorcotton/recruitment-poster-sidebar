@@ -49,9 +49,9 @@ button:focus-visible,
   overflow: hidden;
 }
 .app-header {
-  height: 68px;
+  height: 52px;
   flex-shrink: 0;
-  padding: 0 24px;
+  padding: 0 20px;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -103,7 +103,7 @@ button:focus-visible,
   background: #f5f7f8;
   font-weight: 450;
 }
-.mode-badge.feishu {
+.mode-badge.local {
   background: #edf8f0;
   color: #39724a;
   border-color: #d1e5d5;
@@ -500,7 +500,7 @@ h3 {
 .record-list {
   display: grid;
   gap: 4px;
-  margin: 0 -4px 14px;
+  margin: 0 -4px 10px;
 }
 .record-row {
   display: flex;
@@ -562,13 +562,13 @@ h3 {
   white-space: nowrap;
 }
 .record-list-heading {
-  margin-bottom: 8px;
+  margin-bottom: 6px;
 }
 .record-list-controls {
   display: flex;
   align-items: center;
   gap: 6px;
-  margin-bottom: 10px;
+  margin-bottom: 8px;
 }
 .record-search {
   flex: 1;
@@ -576,6 +576,85 @@ h3 {
 }
 .record-list-controls .semi-button {
   flex: none;
+}
+.record-filter-row {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+.record-filter-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+  padding: 4px 6px;
+  border: 1px solid #dbe4e6;
+  border-radius: 4px;
+  background: #fff;
+  font-size: 11px;
+  line-height: 16px;
+  color: #58666d;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.record-filter-chip:hover {
+  border-color: #b7c6cb;
+}
+.record-filter-chip.is-active {
+  border-color: #007c83;
+  background: #eef7f7;
+  color: #00656b;
+  font-weight: 600;
+}
+.record-filter-count {
+  color: #8b9aa1;
+  font-variant-numeric: tabular-nums;
+}
+.record-filter-chip.is-active .record-filter-count {
+  color: #007c83;
+}
+.record-select-all {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+  padding: 0 4px;
+  font-size: 11px;
+  color: #5f6f77;
+}
+.record-select-all label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+.record-select-all input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: #007c83;
+  flex-shrink: 0;
+}
+.record-select-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #8b9aa1;
+  white-space: nowrap;
+}
+.record-link {
+  border: 0;
+  padding: 0;
+  background: none;
+  font-size: 11px;
+  color: #007c83;
+  cursor: pointer;
+}
+.record-link:hover {
+  text-decoration: underline;
 }
 .record-batch-actions {
   display: grid;
@@ -1006,8 +1085,8 @@ h3 {
 @media (max-width: 760px) {
   .app-header {
     height: auto;
-    min-height: 65px;
-    padding: calc(10px + env(safe-area-inset-top)) 12px 10px;
+    min-height: 52px;
+    padding: calc(6px + env(safe-area-inset-top)) 12px 6px;
     align-items: flex-start;
     flex-wrap: wrap;
     gap: 8px;
@@ -1289,12 +1368,47 @@ h3 {
   text-transform: uppercase;
 }
 .records-workspace {
+  /* 左栏宽度由分隔条拖动改写的内联变量覆盖；未改过时用这里的默认值。 */
+  --browser-width: 200px;
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: 180px minmax(0, 1fr);
+  grid-template-columns: var(--browser-width) 9px minmax(0, 1fr);
   overflow: hidden;
   background: #f4f7f7;
+}
+/* 拖动中禁止选中文本，并全程保持列宽光标。 */
+.records-workspace.is-resizing {
+  user-select: none;
+  cursor: col-resize;
+}
+.records-resize-handle {
+  position: relative;
+  display: grid;
+  place-items: center;
+  touch-action: none;
+  cursor: col-resize;
+  background: #eef3f4;
+  border-inline: 1px solid #dfe5e7;
+  transition: background 0.12s ease;
+}
+.records-resize-handle:hover,
+.records-resize-handle:focus-visible {
+  background: #dcebe8;
+  outline: none;
+}
+.records-resize-handle:focus-visible {
+  box-shadow: inset 0 0 0 2px #0f8f7a;
+}
+.records-resize-grip {
+  width: 3px;
+  height: 28px;
+  border-radius: 2px;
+  background: #b4c4c7;
+}
+.records-resize-handle:hover .records-resize-grip,
+.records-resize-handle:focus-visible .records-resize-grip {
+  background: #0f8f7a;
 }
 .records-browser {
   min-height: 0;
@@ -1303,31 +1417,47 @@ h3 {
   border-right: 1px solid #dfe5e7;
 }
 .record-table-card {
+  /* 两行网格：标签与切换按钮同一行，表名独占一行，避免纵向堆叠吃掉海报高度。 */
   display: grid;
-  gap: 8px;
-  justify-items: start;
-  padding: 18px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas:
+    "eyebrow action"
+    "name name";
+  align-items: center;
+  gap: 2px 8px;
+  padding: 8px 12px;
   border-bottom: 1px solid #e3e9eb;
 }
+.record-table-card .record-eyebrow {
+  grid-area: eyebrow;
+}
 .record-table-card strong {
+  /* 表名常常很长，单行省略保高度，悬停 title 看全名。 */
+  grid-area: name;
   font-size: 13px;
-  line-height: 1.5;
-  overflow-wrap: anywhere;
+  line-height: 1.4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.record-table-card .semi-button {
+  grid-area: action;
+  white-space: nowrap;
 }
 .record-section {
-  padding: 16px 14px 20px;
+  padding: 12px 12px 16px;
 }
 .records-preview-column {
   min-width: 0;
   min-height: 0;
   overflow: auto;
-  padding: 20px;
+  padding: 14px;
   background: #e9eef0;
 }
 .readonly-poster-header h2 {
-  margin: 7px 0 6px;
+  margin: 2px 0 0;
   font-size: 18px;
-  line-height: 1.4;
+  line-height: 1.35;
   color: #243239;
   overflow-wrap: anywhere;
 }
@@ -1345,7 +1475,7 @@ h3 {
   align-items: center;
   justify-content: space-between;
   gap: 14px;
-  padding: 16px 18px;
+  padding: 10px 14px;
   border-bottom: 1px solid #e0e7e9;
 }
 .readonly-poster-header h2 {
@@ -1471,17 +1601,17 @@ h3 {
 }
 @media (max-width: 1100px) {
   .records-workspace {
-    grid-template-columns: clamp(156px, 15vw, 180px) minmax(0, 1fr);
+    --browser-width: clamp(168px, 16vw, 200px);
   }
 }
 /* 绝大多数宽度保持左右结构：窄屏只收紧左栏与内边距，不做上下堆叠。 */
 @media (max-width: 760px) {
   .records-workspace {
-    grid-template-columns: clamp(124px, 26vw, 168px) minmax(0, 1fr);
+    --browser-width: clamp(124px, 26vw, 168px);
   }
   .record-table-card {
     gap: 6px;
-    padding: 12px 10px;
+    padding: 8px 10px;
   }
   .record-table-card strong {
     font-size: 12px;
@@ -1518,6 +1648,10 @@ h3 {
     flex-direction: column;
     overflow-y: auto;
   }
+  /* 上下堆叠时没有左右比例可调，分隔条直接隐藏。 */
+  .records-resize-handle {
+    display: none;
+  }
   .records-browser,
   .records-preview-column {
     flex: none;
@@ -1529,15 +1663,8 @@ h3 {
     border-bottom: 1px solid #dfe5e7;
   }
   .record-table-card {
-    grid-template-columns: minmax(0, 1fr) auto;
     gap: 4px 10px;
-    padding: 12px 14px;
-  }
-  .record-table-card .semi-button {
-    grid-column: 2;
-    grid-row: 1 / span 2;
-    align-self: center;
-    min-height: 36px;
+    padding: 8px 12px;
   }
   .record-section {
     padding-block: 10px 12px;
@@ -1580,6 +1707,21 @@ h3 {
   color: #5f6f77;
   font-size: 12px;
   line-height: 1.7;
+}
+/* 模板表字段读取失败时，下拉里会缺少整组模板表字段，必须先解释原因再提供重试。 */
+.mapping-warning {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  max-width: 1080px;
+  margin: 0 auto 12px;
+  padding: 10px 14px;
+  color: #805022;
+  background: #fff5e9;
+  border-radius: 7px;
+  font-size: 11px;
+  line-height: 1.6;
 }
 /* 每个文字图层一张配置卡：标签 + 字段下拉 + 当前取值，结构同设置页的字段绑定。 */
 .mapping-card {

@@ -1,4 +1,4 @@
-import { bindingKey, parseBinding } from "../../domain/field-binding";
+import { bindingKey, isBindableField, parseBinding } from "../../domain/field-binding";
 import type { TableField, TextBox } from "../../domain/types";
 
 export interface BindingOption {
@@ -19,7 +19,7 @@ const FIXED_VALUE = "__fixed__";
 
 /** 可绑定的文字字段：附件和未知类型不能作为文字内容。 */
 export function textFieldsOf(fields: TableField[]) {
-  return fields.filter((field) => field.kind !== "attachment" && field.kind !== "other");
+  return fields.filter(isBindableField);
 }
 
 /** 图层当前的绑定键；未绑字段时是固定文字的占位值。 */

@@ -6,6 +6,11 @@ export function bindingKey(fieldTableId: string | null | undefined, fieldId: str
   return fieldTableId ? `${fieldTableId}::${fieldId}` : fieldId;
 }
 
+/** 可绑定为文字内容的字段类型：附件和未知类型不参与文字绑定。 */
+export function isBindableField(field: { kind: string }): boolean {
+  return field.kind !== "attachment" && field.kind !== "other";
+}
+
 /** 把模板行字段值整体加上表维度，供渲染值和 UI 预览共用。 */
 export function scopeValues(
   fieldTableId: string,

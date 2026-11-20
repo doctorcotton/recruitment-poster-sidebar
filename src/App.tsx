@@ -40,11 +40,21 @@ import { hasUnsavedChanges } from "./application/draft-state";
 import {
   runBatchWrite,
   summarizeBatch,
+  describeBatchSummary,
   canRetryBatchRow,
   type BatchRowResult,
 } from "./application/batch-write";
+import { describeRepairs, repairBundle, type BindingRepair } from "./application/binding-repair";
 import { recordPages } from "./domain/record-pages";
 import { findUnwrittenRows, type UnwrittenPlan } from "./application/unwritten-write";
+import {
+  countRecordOutputs,
+  filterRecordsByOutput,
+  recordOutputState,
+  selectAllState,
+  toggleSelectAll,
+  type RecordOutputFilter,
+} from "./application/record-filter";
 import { WorkspaceSetup } from "./features/workspace/WorkspaceSetup";
 import { WorkspaceTabs, type WorkspaceTab } from "./features/shell/WorkspaceTabs";
 import { TemplateListPanel } from "./features/template/TemplateListPanel";
@@ -146,6 +156,12 @@ export default function App() {
   const [recordHasMore, setRecordHasMore] = useState(false);
   const [recordSearch, setRecordSearch] = useState("");
   const [selectedRecordIds, setSelectedRecordIds] = useState<Set<string>>(new Set());
+  const [recordOutputFilter, setRecordOutputFilter] = useState<RecordOutputFilter>("all");
+  /** 生成已选记录前的覆盖确认；只装需要二次确认的整批行。 */
+  const [overwritePlan, setOverwritePlan] = useState<{
+    rows: DataRecord[];
+    replacing: number;
+  } | null>(null);
   const [batchOpen, setBatchOpen] = useState(false);
   const [allTableRows, setAllTableRows] = useState<DataRecord[] | null>(null);
   const [scanCount, setScanCount] = useState(0);
@@ -235,16 +251,34 @@ export default function App() {
     () => fields?.filter((field) => field.kind === "attachment") ?? [],
     [fields],
   );
-  const visibleRecords = useMemo(() => {
+  const searchedRecords = useMemo(() => {
     const query = recordSearch.trim().toLocaleLowerCase();
     return (
       (query ? records?.filter((row) => row.label.toLocaleLowerCase().includes(query)) : records) ??
       []
     );
   }, [recordSearch, records]);
+  // 筛选按输出附件状态在本地判断，浏览“没出图的行”不需要任何远程读取。
+  const visibleRecords = useMemo(
+    () => filterRecordsByOutput(searchedRecords, outputFieldId, recordOutputFilter),
+    [searchedRecords, outputFieldId, recordOutputFilter],
+  );
+  const outputCounts = useMemo(
+    () => countRecordOutputs(searchedRecords, outputFieldId),
+    [searchedRecords, outputFieldId],
+  );
   const selectedRows = useMemo(
     () => records?.filter((row) => selectedRecordIds.has(row.id)) ?? [],
     [records, selectedRecordIds],
+  );
+  // 全选只覆盖筛选后可见的行；选择本身跨筛选保留，切回“全部”仍然在。
+  const selectAll = useMemo(
+    () =>
+      selectAllState(
+        visibleRecords.map((row) => row.id),
+        selectedRecordIds,
+      ),
+    [visibleRecords, selectedRecordIds],
   );
   const backgroundKey = JSON.stringify([
     context?.tableId,
@@ -393,25 +427,34 @@ export default function App() {
     else requestLoad(recordId);
   }
 
+  // 模板表字段是失效判定与绑定下拉的共同依据：读取失败必须显式暴露并可重试，
+  // 不能把字段池清空，否则已绑定的图层会被误判成“字段已删除”。
+  const [templateFieldsError, setTemplateFieldsError] = useState("");
+  const [templateFieldsAttempt, setTemplateFieldsAttempt] = useState(0);
+  const reloadTemplateFields = () => setTemplateFieldsAttempt((value) => value + 1);
   useEffect(() => {
     const refTableId = fields?.find((field) => field.id === templateFieldId)?.refTableId;
     if (!refTableId) {
       setTemplateFields((current) => (current.length ? [] : current));
+      setTemplateFieldsError("");
       return;
     }
     let disposed = false;
     void repository
       .loadContext(refTableId, false)
       .then((metadata) => {
-        if (!disposed) setTemplateFields(metadata.fields);
+        if (disposed) return;
+        setTemplateFields(metadata.fields);
+        setTemplateFieldsError("");
       })
-      .catch(() => {
-        if (!disposed) setTemplateFields((current) => (current.length ? [] : current));
+      .catch((error) => {
+        if (disposed) return;
+        setTemplateFieldsError(error instanceof Error ? error.message : "模板表字段元数据读取失败");
       });
     return () => {
       disposed = true;
     };
-  }, [repository, fields, templateFieldId]);
+  }, [repository, fields, templateFieldId, templateFieldsAttempt]);
 
   // 模板页的列表与选中行；记录页不参与这套状态。
   useEffect(() => {
@@ -637,6 +680,8 @@ export default function App() {
       setRecordHasMore(firstPage.hasMore);
       setRecordSearch("");
       setSelectedRecordIds(new Set());
+      setRecordOutputFilter("all");
+      setOverwritePlan(null);
       setBatchOpen(false);
       setBatchResults([]);
       setProgress(null);
@@ -1325,17 +1370,41 @@ export default function App() {
       job.current = controller;
       setBatchResults([]);
       setProgress({ done: 0, total: requestedRows.length });
+      // 预检必须用宿主的实时字段元数据：状态里的模板表字段可能尚未加载完，
+      // 用空列表判定会把正常绑定误报成“字段已失效”，整批直接被挡在渲染之前。
+      let preflightTemplateTable: { tableId: string; fields: TableField[] } | null = null;
+      if (templateTableId) {
+        try {
+          const templateMetadata = await repository.loadContext(templateTableId, false);
+          preflightTemplateTable = { tableId: templateTableId, fields: templateMetadata.fields };
+          setTemplateFields(templateMetadata.fields);
+          setTemplateFieldsError("");
+        } catch (error) {
+          throw new Error(
+            `模板表字段未读取完成，无法校验图层绑定：${
+              error instanceof Error ? error.message : "读取失败"
+            }，请点「重新读取字段」后再试`,
+          );
+        }
+      }
+      // 历史模板里的失效绑定先按同名自动修复：模板行文案改名或换表后，
+      // 整批写回不该被一条旧绑定挡住；修复只作用于本轮出图，不改已保存的模板。
+      const repaired = new Map<string, BindingRepair>();
+      const withRepairedBindings = (input: TemplateBundle): TemplateBundle => {
+        const result = repairBundle(input, taskContext, preflightTemplateTable);
+        for (const item of result.repairs) repaired.set(item.boxId, item);
+        return result.bundle;
+      };
       const results = await runBatchWrite(
         requestedRows,
         taskContext,
         targetFieldId,
         controller.signal,
         {
-          templateTable: templateTableId
-            ? { tableId: templateTableId, fields: templateFields }
-            : null,
+          templateTable: preflightTemplateTable,
           prepareBundle: async (row) => {
-            if (!templateFieldId || !templateBackgroundFieldId) return snapshot;
+            if (!templateFieldId || !templateBackgroundFieldId)
+              return withRepairedBindings(snapshot);
             const source = await repository.getTemplateSource(
               row.id,
               templateFieldId,
@@ -1353,10 +1422,10 @@ export default function App() {
             rowValues.set(row.id, scoped);
             // 当前来源使用正在编辑的版式；其他来源读取其各自保存的模板。
             if (currentSource && sourceId === `${currentSource.tableId}:${currentSource.recordId}`)
-              return snapshot;
+              return withRepairedBindings(snapshot);
             const saved = await repository.loadSourceTemplate(source);
             if (!saved) throw new Error(`模板“${source.recordName}”尚未保存，请先选择并保存该模板`);
-            return saved;
+            return withRepairedBindings(saved);
           },
           // 逐行渲染同样要完整字体，避免写回的海报只有常用字。
           resolveBundle: async (_row, rowTemplate) => rowTemplate,
@@ -1424,9 +1493,12 @@ export default function App() {
         outcomeUnknown: summary.unknown,
         stopped: summary.stopped,
       });
+      const repairedText = repaired.size ? describeRepairs([...repaired.values()]) : "";
       setNotice({
-        kind: issues ? "warning" : "success",
-        text: `${repository.mode === "local" ? "本地示例" : "多维表"}处理完成：成功 ${summary.succeeded}，失败 ${summary.failed}，冲突 ${summary.conflict}，结果未知 ${summary.unknown}，停止 ${summary.stopped}。${issues ? "请查看逐行结果，未知和冲突项不会自动重试。" : ""}`,
+        kind: issues || repairedText ? "warning" : "success",
+        text: `${repository.mode === "local" ? "本地示例" : "多维表"}生成：${describeBatchSummary(summary)}${
+          repairedText ? `；修复绑定：${repairedText}（保存模板可固化）` : ""
+        }`,
       });
     });
   }
@@ -1523,6 +1595,8 @@ export default function App() {
       setRecordPageToken(firstPage.pageToken);
       setRecordHasMore(firstPage.hasMore);
       setSelectedRecordIds(new Set());
+      setRecordOutputFilter("all");
+      setOverwritePlan(null);
       setBatchOpen(false);
       setAllTableRows(null);
       setUnwrittenPlan(null);
@@ -1616,6 +1690,32 @@ export default function App() {
       else next.add(id);
       return next;
     });
+  }
+
+  function toggleAllRecords() {
+    setSelectedRecordIds((current) =>
+      toggleSelectAll(
+        current,
+        visibleRecords.map((row) => row.id),
+      ),
+    );
+  }
+
+  function clearRecordSelection() {
+    setSelectedRecordIds(new Set());
+  }
+
+  /** 生成已选：全为空附件时走 emptyOnly 安全写回，命中已有附件先确认再覆盖。 */
+  function writeSelected() {
+    if (!selectedRows.length) return;
+    const replacing = selectedRows.filter(
+      (row) => recordOutputState(row, outputFieldId) === "written",
+    ).length;
+    if (replacing) {
+      setOverwritePlan({ rows: selectedRows, replacing });
+      return;
+    }
+    void write(selectedRows, true);
   }
 
   function scanTable(emptyOnly: boolean) {
@@ -1735,9 +1835,8 @@ export default function App() {
             <span />
           </div>
           <strong>招聘海报</strong>
-          <span className={`mode-badge ${repository.mode}`}>
-            {repository.mode === "local" ? "本地示例" : "多维表"}
-          </span>
+          {/* 飞书模式不再挂「多维表」标签，只有本地示例需要提示当前数据源。 */}
+          {repository.mode === "local" && <span className="mode-badge local">本地示例</span>}
         </div>
         <WorkspaceTabs
           value={activeTab}
@@ -1862,14 +1961,21 @@ export default function App() {
                 batchOpen={batchOpen}
                 disabled={controlsDisabled}
                 canGenerate={actions.canWriteBatch}
+                canFilter={Boolean(outputFieldId)}
+                filter={recordOutputFilter}
+                counts={outputCounts}
+                selectAll={selectAll}
                 blockerText={actions.writeBlockerText}
                 onSearch={setRecordSearch}
                 onSelectRecord={requestRecordChange}
                 onToggleRecord={toggleRecordSelection}
+                onToggleAll={toggleAllRecords}
+                onClearSelection={clearRecordSelection}
+                onFilter={setRecordOutputFilter}
                 onToggleBatch={() => setBatchOpen((current) => !current)}
                 onLoadMore={loadMoreRecords}
                 onRefresh={requestRefresh}
-                onWriteSelected={() => write(selectedRows)}
+                onWriteSelected={writeSelected}
                 onRequestAll={() => scanTable(false)}
                 onWriteUnwritten={() => scanTable(true)}
               >
@@ -2155,12 +2261,17 @@ export default function App() {
             dirty={dirty}
             disabled={controlsDisabled}
             sourceError={sourceError}
+            templateFieldsError={templateFieldsError}
+            onReloadTemplateFields={reloadTemplateFields}
             onTemplateFieldChange={requestTemplateFieldChange}
             onTemplateBackgroundFieldChange={requestTemplateBackgroundFieldChange}
             onOutputFieldChange={(id) => {
               setOutputFieldId(id);
               setBatchResults([]);
               setProgress(null);
+              // 未生成状态是相对输出字段的：换字段后旧的勾选与筛选都会误判。
+              setSelectedRecordIds(new Set());
+              setRecordOutputFilter("all");
               lastTask.current = null;
             }}
             onSwitchTable={requestTableSwitch}
@@ -2173,6 +2284,8 @@ export default function App() {
             templateTableId={templateTableId}
             values={values}
             disabled={controlsDisabled}
+            templateFieldsError={templateFieldsError}
+            onReloadTemplateFields={reloadTemplateFields}
             onChange={changeBox}
           />
         )}
@@ -2234,7 +2347,34 @@ export default function App() {
         </p>
       </Modal>
       <Modal
-        title="一键生成写回"
+        title="覆盖已有附件"
+        visible={overwritePlan !== null}
+        onCancel={() => setOverwritePlan(null)}
+        footer={
+          <>
+            <Button onClick={() => setOverwritePlan(null)}>取消</Button>
+            <Button
+              theme="solid"
+              type="danger"
+              disabled={!overwritePlan?.rows.length}
+              onClick={() => {
+                const rows = overwritePlan?.rows;
+                setOverwritePlan(null);
+                if (rows) void write(rows);
+              }}
+            >
+              替换 {overwritePlan?.replacing ?? 0} 条
+            </Button>
+          </>
+        }
+      >
+        <p>
+          已选 {overwritePlan?.rows.length ?? 0} 条记录，其中 {overwritePlan?.replacing ?? 0}{" "}
+          条已有输出附件，将被新生成的海报替换，原附件不可恢复。
+        </p>
+      </Modal>
+      <Modal
+        title="补齐未生成记录"
         visible={unwrittenPlan !== null}
         onCancel={() => setUnwrittenPlan(null)}
         footer={

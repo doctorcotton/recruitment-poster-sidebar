@@ -15,6 +15,9 @@ interface Props {
   dirty: boolean;
   disabled: boolean;
   sourceError: string;
+  /** 模板表字段元数据读取失败的原因；有值时底图字段下拉会缺少选项。 */
+  templateFieldsError?: string;
+  onReloadTemplateFields?(): void;
   onTemplateFieldChange(value: string): void;
   onTemplateBackgroundFieldChange(value: string): void;
   onOutputFieldChange(value: string): void;
@@ -103,6 +106,16 @@ export function SettingsPanel(props: Props) {
             style={{ width: "100%" }}
           />
         </div>
+        {props.templateFieldsError && (
+          <p className="settings-error" role="status">
+            模板表字段读取失败：{props.templateFieldsError}
+            {props.onReloadTemplateFields && (
+              <Button size="small" onClick={props.onReloadTemplateFields}>
+                重新读取字段
+              </Button>
+            )}
+          </p>
+        )}
         {props.sourceError && (
           <p className="settings-error" role="alert">
             {props.sourceError}

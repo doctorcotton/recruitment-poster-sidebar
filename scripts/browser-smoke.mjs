@@ -303,6 +303,26 @@ try {
     );
     await page.screenshot({ path: `${output}/records-workspace.png` });
   });
+  await check("记录栏宽度可拖动、持久化并双击还原", async () => {
+    const handle = page.locator(".records-resize-handle");
+    await handle.waitFor({ state: "visible" });
+    const pane = page.locator(".records-browser");
+    const before = (await pane.boundingBox()).width;
+    const grip = await handle.boundingBox();
+    await page.mouse.move(grip.x + grip.width / 2, grip.y + grip.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(grip.x + grip.width / 2 + 90, grip.y + grip.height / 2, { steps: 8 });
+    await page.mouse.up();
+    const after = (await pane.boundingBox()).width;
+    assert.ok(after > before + 60, `拖动后左栏应明显变宽：${before} → ${after}`);
+    assert.equal(
+      await page.evaluate(() => localStorage.getItem("recruitment-poster.browser-width")),
+      String(Math.round(after)),
+    );
+    // 还原默认宽度，避免影响后续截图与窄屏断言。
+    await handle.dblclick();
+    assert.ok(Math.abs((await pane.boundingBox()).width - before) < 2, "双击应恢复默认宽度");
+  });
   await check("顶部模块分为记录、模板、设置三块", async () => {
     const tabs = page.locator(".workspace-tab");
     assert.deepEqual(await tabs.allInnerTexts(), ["记录", "模板", "设置"]);
@@ -662,20 +682,20 @@ try {
     await closeNotice();
     assert.equal(await page.locator(".output-list button").count(), 1);
     await page.getByRole("button", { name: "批量生成", exact: true }).click();
-    await page.getByRole("button", { name: "一键生成写回", exact: true }).click();
+    await page.getByRole("button", { name: "补齐未生成记录", exact: true }).click();
     assert.ok(
-      (await page.getByRole("dialog", { name: "一键生成写回", exact: true }).innerText()).includes(
-        "已有附件跳过 1 条",
-      ),
+      (
+        await page.getByRole("dialog", { name: "补齐未生成记录", exact: true }).innerText()
+      ).includes("已有附件跳过 1 条"),
     );
     await page.getByRole("button", { name: "确认生成 2 条", exact: true }).click();
     await page.locator(".notice").filter({ hasText: "成功 2" }).waitFor();
     await closeNotice();
     assert.equal(await page.locator(".output-list button").count(), 3);
-    await page.getByRole("button", { name: "一键生成写回", exact: true }).click();
+    await page.getByRole("button", { name: "补齐未生成记录", exact: true }).click();
     await page.locator(".notice").filter({ hasText: "无需生成" }).waitFor();
     await closeNotice();
-    await page.getByRole("button", { name: "读取全表并生成", exact: true }).click();
+    await page.getByRole("button", { name: "全表重新生成", exact: true }).click();
     await page.getByRole("button", { name: "确认生成 3 条", exact: true }).click();
     await page.locator(".notice").filter({ hasText: "成功 3" }).waitFor();
     await closeNotice();
@@ -687,11 +707,27 @@ try {
     await page.getByLabel("搜索已加载记录", { exact: true }).fill("");
     await page.getByLabel("选择批量记录 本地示例 · 门店伙伴", { exact: true }).check();
     await page.getByLabel("选择批量记录 本地示例 · 设计助理", { exact: true }).check();
-    await page.getByRole("button", { name: "生成已选记录 · 2", exact: true }).click();
+    await page.getByRole("button", { name: "生成已选 · 2", exact: true }).click();
+    // 这两条已有附件，覆盖前必须二次确认。
+    await page.getByRole("button", { name: "替换 2 条", exact: true }).click();
     await page.locator(".notice").filter({ hasText: "成功 2" }).waitFor();
     await closeNotice();
     assert.equal(await page.locator(".batch-result-row.status-succeeded").count(), 2);
     assert.equal(await page.locator(".output-list button").count(), 3);
+  });
+  await check("按输出附件筛选并全选当前结果", async () => {
+    // 前面已把三条记录都写回：未生成为空、已生成三条。
+    await page.getByRole("button", { name: "未生成 0", exact: true }).click();
+    assert.equal(await page.locator(".record-row").count(), 0);
+    await page.getByRole("button", { name: "已生成 3", exact: true }).click();
+    assert.equal(await page.locator(".record-row").count(), 3);
+    await page.getByLabel("全选筛选结果", { exact: true }).check();
+    await page.locator(".record-select-summary").filter({ hasText: "已选 3 条" }).waitFor();
+    await page.getByRole("button", { name: "清空", exact: true }).click();
+    assert.equal(await page.getByLabel("全选筛选结果", { exact: true }).isChecked(), false);
+    await page.getByRole("button", { name: "全部 3", exact: true }).click();
+    // 后续用例依赖这条勾选状态，清空断言完再勾回来。
+    await page.getByLabel("选择批量记录 本地示例 · 门店伙伴", { exact: true }).check();
   });
   await check("高级编辑往返保留记录搜索和批量勾选", async () => {
     await page.getByLabel("搜索已加载记录", { exact: true }).fill("门店");
@@ -950,7 +986,7 @@ try {
       ".records-workspace, .records-browser, .records-preview-column",
     );
     await page.getByRole("button", { name: "批量生成", exact: true }).click();
-    await page.getByRole("button", { name: "读取全表并生成", exact: true }).click();
+    await page.getByRole("button", { name: "全表重新生成", exact: true }).click();
     await page.getByRole("button", { name: "确认生成 43 条", exact: true }).click();
     // 模板行模式每行都要定位与读取，给批量留出更长的完成时间。
     await page

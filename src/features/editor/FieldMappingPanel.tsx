@@ -1,4 +1,4 @@
-import { Select } from "../../ui/semi";
+import { Button, Select } from "../../ui/semi";
 import type { PosterTemplate, TableField, TextBox } from "../../domain/types";
 import {
   bindingOptionsOf,
@@ -17,6 +17,9 @@ interface Props {
   templateTableId: string | null;
   values: Record<string, string>;
   disabled: boolean;
+  /** 模板表字段元数据读取失败的原因；有值时下拉里不会出现模板表字段。 */
+  templateFieldsError?: string;
+  onReloadTemplateFields?(): void;
   onChange(id: string, updates: Partial<TextBox>, remember?: boolean): void;
 }
 
@@ -35,6 +38,16 @@ export function FieldMappingPanel(props: Props) {
           文字图层可绑数据表的行变量，也可绑模板表的固定文案；不绑字段即为固定文字。写入附件等插件级设置见「设置」。
         </p>
       </header>
+      {props.templateFieldsError && (
+        <p className="mapping-warning" role="status">
+          <span>模板表字段读取失败：{props.templateFieldsError}</span>
+          {props.onReloadTemplateFields && (
+            <Button size="small" onClick={props.onReloadTemplateFields}>
+              重新读取字段
+            </Button>
+          )}
+        </p>
+      )}
       <section className="mapping-card" aria-labelledby="mapping-card-title">
         <div className="mapping-card-heading">
           <h2 id="mapping-card-title">

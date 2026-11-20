@@ -1,3 +1,4 @@
+import { bindingState } from "./binding-repair";
 import {
   PosterError,
   type DataRecord,
@@ -50,13 +51,14 @@ export function validateWriteBundle(
   const output = context.fields.find((field) => field.id === outputFieldId);
   if (!output || output.kind !== "attachment")
     throw new PosterError("INVALID_ASSET", "请选择有效的附件输出字段");
-  // 图层可能绑数据表变量，也可能绑模板行文案，两张表的字段集都要参与失效判断。
-  const missing = bundle.template.boxes.filter((box) => {
-    if (!box.fieldId) return false;
-    if (!box.fieldTableId) return !context.fields.some((field) => field.id === box.fieldId);
-    if (box.fieldTableId !== templateTable?.tableId) return true;
-    return !templateTable.fields.some((field) => field.id === box.fieldId);
-  });
+  // 失效判定与自动修复共用 bindingState：模板表字段池没读到时报“未读取”，
+  // 只有字段确实不存在时才引导用户重绑。
+  const states = bundle.template.boxes.map(
+    (box) => [box, bindingState(box, context, templateTable ?? null)] as const,
+  );
+  if (states.some(([, state]) => state === "unknown"))
+    throw new PosterError("INVALID_TEMPLATE", "模板表字段未读取完成，请刷新工作区后重试");
+  const missing = states.filter(([, state]) => state === "stale").map(([box]) => box);
   if (missing.length)
     throw new PosterError(
       "INVALID_TEMPLATE",
@@ -103,6 +105,16 @@ export function summarizeBatch(results: BatchRowResult[]) {
 
 function message(error: unknown): string {
   return error instanceof Error ? error.message : "操作失败";
+}
+
+/** 结果摘要只列非零项，成功以外的细节在逐行结果里看。 */
+export function describeBatchSummary(summary: ReturnType<typeof summarizeBatch>): string {
+  const parts = [`成功 ${summary.succeeded}`];
+  if (summary.failed) parts.push(`失败 ${summary.failed}`);
+  if (summary.conflict) parts.push(`冲突 ${summary.conflict}`);
+  if (summary.unknown) parts.push(`未知 ${summary.unknown}`);
+  if (summary.stopped) parts.push(`停止 ${summary.stopped}`);
+  return parts.join("，");
 }
 
 /**
