@@ -62,6 +62,7 @@ export function validateTemplate(value: unknown): PosterTemplate {
     if (!Number.isInteger(maxLines)) fail("最大行数必须为整数");
     if (item.locked !== undefined && typeof item.locked !== "boolean")
       fail("图层锁定状态必须为布尔值");
+    if (item.italic !== undefined && typeof item.italic !== "boolean") fail("斜体状态必须为布尔值");
     return {
       id: boxId,
       label: string(item.label, "文本框名称"),
@@ -83,6 +84,7 @@ export function validateTemplate(value: unknown): PosterTemplate {
       align: item.align,
       lineHeight: number(item.lineHeight, "行距", 1, 10),
       maxLines,
+      ...(item.italic === undefined ? {} : { italic: item.italic === true }),
       ...(item.locked === undefined ? {} : { locked: item.locked === true }),
     };
   });

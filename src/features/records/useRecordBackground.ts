@@ -69,11 +69,13 @@ export function useRecordBackground(options: Options) {
       );
       if (!current()) return;
       setTemplateSource(source);
-      const recordValues = await repository.loadTemplateRecord(source);
+      // 行值与已保存配置互不依赖，并行读取可省掉一次串行往返。
+      const [recordValues, saved] = await Promise.all([
+        repository.loadTemplateRecord(source),
+        repository.loadSourceTemplate(source),
+      ]);
       if (!current()) return;
       setTemplateRecord(recordValues);
-      const saved = await repository.loadSourceTemplate(source);
-      if (!current()) return;
       if (saved) {
         const loaded = await callbacks.current.prepareBundle(saved);
         if (!current()) return;

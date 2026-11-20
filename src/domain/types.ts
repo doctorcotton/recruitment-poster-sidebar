@@ -71,6 +71,8 @@ export interface TextBox {
   align: "left" | "center" | "right";
   lineHeight: number;
   maxLines: number;
+  /** 可选声明；字体文件没有真斜体时由浏览器合成倾斜。 */
+  italic?: boolean;
   /** 可选的向后兼容声明；锁定时禁止移动、缩放和属性修改。 */
   locked?: boolean;
 }

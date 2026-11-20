@@ -391,7 +391,7 @@ test("记录列表按视图顺序读取，不传视图时才是表内插入顺�
   assert.deepEqual(mock.main.pageCalls.at(-1), { pageSize: 50 });
 });
 
-test("保存并重读模板：稳定 ID、刷新附件 URL、完整素材字节、没有临时 URL 持久化", async () => {
+test("保存并重读模板：稳定 ID、素材字节常驻复用、没有临时 URL 持久化", async () => {
   const mock = mockSdk();
   const repo = new FeishuPosterRepository(mock);
   assert.deepEqual(await repo.listTemplates(), []);
@@ -411,8 +411,9 @@ test("保存并重读模板：稳定 ID、刷新附件 URL、完整素材字节�
   assert.equal(mock.fetchUrls.length, 2);
   reopened.invalidate();
   await reopened.loadTemplate("template-1");
-  assert.equal(mock.templates.urlGeneration, 2);
-  assert.match(mock.fetchUrls[2], /v=2$/);
+  // 临时 URL 会过期，但字节按 token + 内容哈希常驻：刷新只重读配置，不再申请 URL。
+  assert.equal(mock.templates.urlGeneration, 1);
+  assert.equal(mock.fetchUrls.length, 2);
   expected.template.name = "改名";
   await repo.saveTemplate(expected);
   assert.equal(mock.templates.rows.size, 1);
@@ -811,14 +812,17 @@ test("在途上下文读取失效后，旧结果不会回填新一代缓存", as
   assert.equal(mock.main.pageCalls.length, 4);
 });
 
-test("素材缓存按 token 和 hash 复用，下载失败后可恢复", async () => {
+test("素材字节按内容常驻：跨 TTL 与刷新后复用，失败可恢复", async () => {
   const mock = mockSdk();
   const writer = new FeishuPosterRepository(mock);
   await writer.saveTemplate(bundle("a"));
   await writer.saveTemplate(bundle("b"));
   let broken = true;
+  let now = 0;
   const repo = new FeishuPosterRepository({
     ...mock,
+    ttlMs: 50,
+    now: () => now,
     fetcher: (async (...args: Parameters<typeof fetch>) => {
       if (broken) throw new TypeError("CORS failure");
       return mock.fetcher(...args);
@@ -829,9 +833,13 @@ test("素材缓存按 token 和 hash 复用，下载失败后可恢复", async (
   await repo.loadTemplate("a");
   await repo.loadTemplate("b");
   assert.equal(mock.fetchUrls.length, 2);
+  // 远超 TTL 仍然命中：键里有 token + 内容哈希，字节不会变。
+  now = 60_000;
+  await repo.loadTemplate("b");
+  assert.equal(mock.fetchUrls.length, 2);
   repo.invalidate();
   await repo.loadTemplate("b");
-  assert.equal(mock.fetchUrls.length, 4);
+  assert.equal(mock.fetchUrls.length, 2);
 });
 
 test("SDK 初始化拒绝后允许显式重新调用，不永久缓存拒绝的 Promise", async () => {
@@ -1022,6 +1030,48 @@ function attach(
   return attachment;
 }
 
+test("切换 Base 后，尚未进入附件缓存的旧请求不能污染新 Base 的同键底图", async () => {
+  const mock = mockSdk();
+  const next = mockSdk();
+  const nextBytes = PNG_BYTES.map((byte, index) => (index === 8 ? 2 : byte));
+  for (const base of [mock, next]) {
+    base.main.fields.push({ id: "background", name: "底图", type: 17 });
+  }
+  assert.deepEqual(attach(mock, "r1", "shared"), attach(next, "r1", "shared", nextBytes));
+  const oldRecord = mock.main.getRecordById.bind(mock.main);
+  let entered!: () => void;
+  let release!: () => void;
+  const started = new Promise<void>((resolve) => (entered = resolve));
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  mock.main.getRecordById = async (id) => {
+    const record = await oldRecord(id);
+    entered();
+    await gate;
+    return record;
+  };
+  mock.sdk.base.getTableById = async () => (mock.state.baseId === "base-1" ? mock.main : next.main);
+  next.main.getCellAttachmentUrls = async () => ["https://next.test/shared"];
+  const repo = new FeishuPosterRepository({
+    ...mock,
+    fetcher: (async (url, init) =>
+      String(url).startsWith("https://next.test/")
+        ? new Response(nextBytes)
+        : mock.fetcher(url, init)) as typeof fetch,
+  });
+  await repo.loadContext("main", false);
+  const stale = repo.loadBackground("r1", "background", "main");
+  await started;
+  mock.state.baseId = "base-2";
+  try {
+    await repo.loadContext("main", false);
+  } finally {
+    release();
+  }
+  assert.deepEqual(new Uint8Array(await (await stale).blob.arrayBuffer()), PNG_BYTES);
+  const current = await repo.loadBackground("r1", "background", "main");
+  assert.deepEqual(new Uint8Array(await current.blob.arrayBuffer()), nextBytes);
+});
+
 test("逐行底图读取真实单元格、PNG/JPEG 字节和 BLAKE2b ID，改名不改变内容 ID", async () => {
   const mock = mockSdk();
   mock.main.fields.push({ id: "background", name: "底图", type: 17 });
@@ -1085,7 +1135,7 @@ test("空、多附件、非图片、文本 Lookup 与无效大小均明确拒绝
   assert.equal(mock.fetchUrls.length, 0);
 });
 
-test("不同记录即使 token 相同也使用各自临时 URL，刷新和附件变化不会串行缓存", async () => {
+test("不同记录即使 token 相同也使用各自临时 URL，附件变化立即生效", async () => {
   const mock = mockSdk();
   mock.main.fields.push({ id: "background", name: "底图", type: 17 });
   attach(mock, "r1", "shared");
@@ -1101,11 +1151,15 @@ test("不同记录即使 token 相同也使用各自临时 URL，刷新和附件
   await repo.loadBackground("r1", "background", "main");
   assert.equal(mock.fetchUrls.length, 2);
   assert.equal(mock.main.urlTokenCalls.length, 2);
+  // 刷新只重读行数据；同一附件快照的字节常驻，不再申请临时 URL。
   repo.invalidate();
   await repo.loadBackground("r1", "background", "main");
-  assert.equal(mock.fetchUrls.length, 3);
+  assert.equal(mock.fetchUrls.length, 2);
+  assert.equal(mock.main.urlTokenCalls.length, 2);
+  // 附件真的换了（新 token）才会重新下载。
   attach(mock, "r1", "replacement", JPEG_BYTES, "background", "image/jpeg");
   assert.equal((await repo.loadBackground("r1", "background", "main")).mimeType, "image/jpeg");
+  assert.equal(mock.fetchUrls.length, 3);
 });
 
 test("底图下载失败不吞错、不缓存拒绝，HTTP 和 SDK 错误码保留且队列可恢复", async () => {
@@ -1272,6 +1326,37 @@ test("查找引用值唯一定位模板行，底图来自模板行附件，预�
   assert.equal(mock.state.tableExists, false);
 });
 
+test("切换记录时同一模板表的字段元数据只读一次，行数据变化立即可见", async () => {
+  const mock = sourceFixture();
+  const repo = new FeishuPosterRepository(mock);
+  mock.source.fieldMetaReads = 0;
+  const source = await repo.getTemplateSource("r1", "posterType", "main", "image");
+  // 定位时读一次模板表字段元数据，行值与配置共用这一份，不再各读一遍。
+  assert.equal(mock.source.fieldMetaReads, 1);
+  await Promise.all([repo.loadTemplateRecord(source), repo.loadSourceTemplate(source)]);
+  assert.equal(mock.source.fieldMetaReads, 1);
+  // 行数据保持直读：模板行在飞书里被改动后，下一次读取要能看到新内容。
+  mock.source.rows.set("s1", { title: "改过的类型", image: [] });
+  assert.equal((await repo.loadTemplateRecord(source)).values.title, "改过的类型");
+});
+
+test("不同记录命中同一模板行时只定位一次、底图只下载一次", async () => {
+  const mock = sourceFixture();
+  mock.main.rows.set("r2", { posterType: [{ text: "正编业代" }] });
+  const repo = new FeishuPosterRepository(mock);
+  const sources = [];
+  for (const recordId of ["r1", "r2"]) {
+    sources.push(await repo.getTemplateSource(recordId, "posterType", "main", "image"));
+  }
+  // 两条业务记录指向同一模板行，定位结果完全一致。
+  assert.deepEqual(sources[0], sources[1]);
+  assert.equal(sources[0].recordId, "s1");
+  for (const source of sources) await repo.loadSourceBackground(source);
+  // 模板行相同 → 附件快照相同 → 只申请一次临时地址、下载一次字节。
+  assert.equal(mock.source.urlTokenCalls.length, 1);
+  assert.equal(mock.fetchUrls.length, 1);
+});
+
 test("模板定位零匹配、多行同键、空引用值、缺少元数据与错误字段均不猜测", async () => {
   const mock = sourceFixture();
   const repo = new FeishuPosterRepository(mock);
@@ -1379,6 +1464,26 @@ test("来源配置仅显式保存时创建字段、上传字体，来源业务�
   mock.uploads.set(next.token, new File([JPEG_BYTES], "next.jpg"));
   assert.equal((await reopened.loadSourceTemplate(source))!.assets[0].mimeType, "image/jpeg");
   assert.equal(mock.state.tableExists, false);
+});
+
+test("其他窗口首次保存配置后，旧字段快照不能绕过修订检查或重复建列", async () => {
+  const mock = sourceFixture();
+  const getFieldMetaList = mock.source.getFieldMetaList.bind(mock.source);
+  mock.source.getFieldMetaList = async () => structuredClone(await getFieldMetaList());
+  const repo = new FeishuPosterRepository(mock);
+  const source = await repo.getTemplateSourceByRow("source", "s1", "image");
+  assert.equal(await repo.loadSourceTemplate(source), null);
+
+  // 独立 SDK 实例模拟另一个窗口，共用宿主数据但各自失效缓存。
+  const other = new FeishuPosterRepository({ ...mock, sdk: { ...mock.sdk } });
+  const revision = await other.saveSourceTemplate(source, bundle(), null);
+  await assert.rejects(repo.saveSourceTemplate(source, bundle(), null), {
+    code: "REVISION_CONFLICT",
+  });
+  assert.equal(mock.source.addedFields.length, 2);
+  assert.equal(mock.source.setRecordCalls.length, 1);
+  assert.equal(mock.state.uploadCalls, 1);
+  assert.equal((await repo.loadSourceTemplate(source))?.revision, revision);
 });
 
 test("来源字段类型冲突、字体缺失/损坏、写入拒绝和错误回读均明确失败", async () => {

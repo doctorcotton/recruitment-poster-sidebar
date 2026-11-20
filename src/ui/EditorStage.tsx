@@ -53,6 +53,10 @@ export function EditorStage({
   const canvas = useRef<HTMLCanvasElement>(null);
   const [scale, setScale] = useState(0.34);
   const [rendering, setRendering] = useState(true);
+  const [devicePixelRatio, setDevicePixelRatio] = useState(() =>
+    typeof window === "undefined" ? 1 : window.devicePixelRatio || 1,
+  );
+  const drawnBundle = useRef<TemplateBundle | null>(null);
   const fitRef = useRef(true);
   const fittedScale = useRef(scale);
   const zoomAnchor = useRef<{
@@ -112,13 +116,29 @@ export function EditorStage({
   }, [fit]);
 
   useEffect(() => {
+    const update = () => setDevicePixelRatio(window.devicePixelRatio || 1);
+    // 跨屏拖动或系统缩放会改变设备像素比，位图要跟着重建才不糊。
+    window.addEventListener("resize", update);
+    return () => window.removeEventListener("resize", update);
+  }, []);
+
+  useEffect(() => {
     const controller = new AbortController();
-    setRendering(true);
+    // 只有换模板或换值才显示加载态；缩放重绘沿用当前画面，避免闪烁。
+    const contentChanged = drawnBundle.current !== bundle;
+    drawnBundle.current = bundle;
+    if (contentChanged) setRendering(true);
     // 拖拽与键盘连发只绘制下一帧实际提交的版本。
     const frame = requestAnimationFrame(() => {
       if (!canvas.current) return;
       void renderer
-        .draw(canvas.current, bundle, values, { preview: true, signal: controller.signal })
+        .draw(canvas.current, bundle, values, {
+          preview: true,
+          // 按画板显示像素请求位图：超采样只会让每帧多填充数倍像素。
+          maxSide:
+            Math.max(template.width, template.height) * scale * Math.min(devicePixelRatio, 2),
+          signal: controller.signal,
+        })
         .then((result) => {
           if (!controller.signal.aborted) {
             onOverflow(result.overflowBoxIds);
@@ -138,7 +158,17 @@ export function EditorStage({
       cancelAnimationFrame(frame);
       controller.abort();
     };
-  }, [bundle, values, renderer, onOverflow, onRenderError]);
+  }, [
+    bundle,
+    values,
+    renderer,
+    scale,
+    devicePixelRatio,
+    template.width,
+    template.height,
+    onOverflow,
+    onRenderError,
+  ]);
 
   const zoom = useCallback((next: number, client?: { x: number; y: number }) => {
     const container = scroller.current;

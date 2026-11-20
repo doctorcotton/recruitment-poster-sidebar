@@ -1,11 +1,17 @@
-import { moveTextBox } from "./geometry";
+import { BOX_PRECISION, moveTextBox, quantize } from "./geometry";
 import type { PosterTemplate, TextBox } from "./types";
 
 export type LayerAlignment =
   "left" | "centerX" | "right" | "top" | "centerY" | "bottom" | "distributeX" | "distributeY";
 
+// 对齐和分布会算出无限小数，落盘前统一量化，避免面板显示值与实际坐标不一致。
 function positioned(box: TextBox, x: number, y: number, template: PosterTemplate): TextBox {
-  return moveTextBox(box, x - box.x, y - box.y, template);
+  return moveTextBox(
+    { ...box, x: quantize(x, BOX_PRECISION.position), y: quantize(y, BOX_PRECISION.position) },
+    0,
+    0,
+    template,
+  );
 }
 
 /** 对齐以所选图层的联合边界为基准；锁定图层不参与，图层数组顺序即渲染顺序。 */

@@ -26,6 +26,14 @@ test("多选对齐以联合边界为基准且不改变原模板", () => {
   assert.equal(aligned.boxes[2].x, 250);
 });
 
+test("右对齐时保留旧模板的小数宽度并收拢到画布内", () => {
+  const input = { ...template(), boxes: [box("a", 10, 20, 50.25), box("b", 450, 80)] };
+  const aligned = alignLayers(input, new Set(["a", "b"]), "right");
+  assert.equal(aligned.boxes[0].width, 50.25);
+  assert.equal(aligned.boxes[0].x + aligned.boxes[0].width, input.width);
+  assert.doesNotThrow(() => validateTemplate(aligned));
+});
+
 test("横向分布保持顺序并计算等间距，锁定图层不参与", () => {
   const input = template();
   const distributed = alignLayers(input, new Set(["a", "b", "c"]), "distributeX");

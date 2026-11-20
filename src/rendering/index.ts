@@ -12,6 +12,8 @@ import { abortable, cancelled, forwardAbort } from "./cancellation";
 
 export interface DrawOptions {
   preview?: boolean;
+  /** 预览位图长边上限；编辑区按显示尺寸传入，避免超采样浪费每帧填充。 */
+  maxSide?: number;
   signal?: AbortSignal;
 }
 export interface DrawResult {
@@ -29,6 +31,19 @@ export interface PosterRenderer {
 }
 
 const MAX_PREVIEW_SIDE = 2048;
+const MIN_PREVIEW_SIDE = 320;
+
+/** 预览位图长边：编辑区按显示像素传入，缺省仍按 2048 上限。 */
+function previewSide(requested: number | undefined): number {
+  if (requested === undefined || !Number.isFinite(requested)) return MAX_PREVIEW_SIDE;
+  return Math.min(MAX_PREVIEW_SIDE, Math.max(MIN_PREVIEW_SIDE, Math.round(requested)));
+}
+
+/** 尺寸未变时不赋值；给 width/height 赋值会重建整块像素缓冲。 */
+function resizeCanvas(canvas: HTMLCanvasElement, width: number, height: number): void {
+  if (canvas.width !== width) canvas.width = width;
+  if (canvas.height !== height) canvas.height = height;
+}
 
 function resolveAssets(bundle: TemplateBundle, template: PosterTemplate) {
   const assets = new Map<string, PosterAsset>();
@@ -57,13 +72,17 @@ export function createPosterRenderer(): PosterRenderer {
   const assets = createRenderAssets(lifetime.signal);
   const layouts = new Map<string, TextLayout>();
   const latestDraw = new WeakMap<HTMLCanvasElement, AbortController>();
+  // 拖拽每帧都要用离屏画布合成，复用同一块缓冲，避免逐帧新建 2K 画布。
+  let stagingCanvas: HTMLCanvasElement | undefined;
+  const staging = () => (stagingCanvas ??= document.createElement("canvas"));
 
   async function paint(
     canvas: HTMLCanvasElement,
     bundle: TemplateBundle,
     values: Record<string, string>,
-    preview: boolean,
+    maxSide: number | null,
     signal: AbortSignal,
+    copyFrame?: () => void,
   ): Promise<DrawResult> {
     const template = validateTemplate(bundle.template);
     const { background, fonts } = resolveAssets(bundle, template);
@@ -76,11 +95,15 @@ export function createPosterRenderer(): PosterRenderer {
     if (signal.aborted) throw cancelled();
     const families = new Map(usedFonts.map((asset, index) => [asset.id, faces[index].family]));
     const { width, height } = template;
-    const scale = preview ? Math.min(1, MAX_PREVIEW_SIDE / Math.max(width, height)) : 1;
-    canvas.width = Math.max(1, Math.round(width * scale));
-    canvas.height = Math.max(1, Math.round(height * scale));
+    const scale = maxSide === null ? 1 : Math.min(1, maxSide / Math.max(width, height));
+    const pixelWidth = Math.max(1, Math.round(width * scale));
+    const pixelHeight = Math.max(1, Math.round(height * scale));
+    resizeCanvas(canvas, pixelWidth, pixelHeight);
     const context = context2d(canvas);
-    context.scale(canvas.width / width, canvas.height / height);
+    // 复用画布时必须显式复位变换并清空，否则上一帧的缩放和像素会残留。
+    context.setTransform(1, 0, 0, 1, 0, 0);
+    context.clearRect(0, 0, pixelWidth, pixelHeight);
+    context.scale(pixelWidth / width, pixelHeight / height);
     const backgroundScale = Math.max(width / image.naturalWidth, height / image.naturalHeight);
     const backgroundWidth = image.naturalWidth * backgroundScale;
     const backgroundHeight = image.naturalHeight * backgroundScale;
@@ -99,15 +122,19 @@ export function createPosterRenderer(): PosterRenderer {
         const key = box.fieldId === null ? null : bindingKey(box.fieldTableId, box.fieldId);
         const text = key !== null && Object.hasOwn(values, key) ? values[key] : box.text;
         let currentSize = 0;
+        // 内置字体只有常规面，斜体由浏览器合成倾斜；测量与绘制必须共用同一个字体串。
+        const fontStyle = box.italic === true ? "italic " : "";
         const setFont = (size: number) => {
           if (currentSize === size) return;
-          context.font = `${size}px "${family}"`;
+          // 带 sans-serif 兜底：子集字体缺字时由系统字体渲染，不会画成空白方块。
+          context.font = `${fontStyle}${size}px "${family}", sans-serif`;
           currentSize = size;
         };
         const layoutKey =
           text.length <= 1024 &&
           JSON.stringify([
             family,
+            fontStyle,
             text,
             box.width,
             box.height,
@@ -130,7 +157,7 @@ export function createPosterRenderer(): PosterRenderer {
         }
         if (layout.overflow) {
           overflowBoxIds.push(box.id);
-          if (!preview)
+          if (maxSide === null)
             throw new PosterError(
               "TEXT_OVERFLOW",
               `文本框“${box.label}”在最小字号下仍溢出，请扩大文本框或缩短内容`,
@@ -161,6 +188,8 @@ export function createPosterRenderer(): PosterRenderer {
     } finally {
       assets.trimFonts();
     }
+    // 绘制和复制之间不让出执行权，避免另一次预览覆盖共享缓冲。
+    copyFrame?.();
     return { overflowBoxIds };
   }
 
@@ -191,20 +220,23 @@ export function createPosterRenderer(): PosterRenderer {
       const controller = new AbortController();
       latestDraw.set(canvas, controller);
       try {
-        return await run(controller, options.signal, async (signal) => {
-          const staging = document.createElement("canvas");
-          try {
-            const result = await paint(staging, bundle, values, options.preview === true, signal);
-            if (signal.aborted) throw cancelled();
-            // 完整绘制后再替换，失败或取消时保留当前画面。
-            const target = context2d(canvas);
-            canvas.width = staging.width;
-            if (canvas.height !== staging.height) canvas.height = staging.height;
-            target.drawImage(staging, 0, 0);
-            return result;
-          } finally {
-            staging.width = staging.height = 0;
-          }
+        return await run(controller, options.signal, (signal) => {
+          const buffer = staging();
+          return paint(
+            buffer,
+            bundle,
+            values,
+            options.preview === true ? previewSide(options.maxSide) : null,
+            signal,
+            () => {
+              if (signal.aborted) throw cancelled();
+              // 完整绘制后再替换，失败或取消时保留当前画面。
+              const target = context2d(canvas);
+              resizeCanvas(canvas, buffer.width, buffer.height);
+              target.clearRect(0, 0, canvas.width, canvas.height);
+              target.drawImage(buffer, 0, 0);
+            },
+          );
         });
       } finally {
         if (latestDraw.get(canvas) === controller) latestDraw.delete(canvas);
@@ -214,7 +246,7 @@ export function createPosterRenderer(): PosterRenderer {
       return run(new AbortController(), callerSignal, async (signal) => {
         const canvas = document.createElement("canvas");
         try {
-          await paint(canvas, bundle, values, false, signal);
+          await paint(canvas, bundle, values, null, signal);
           if (signal.aborted) throw cancelled();
           const encoded = new Promise<Blob>((resolve, reject) => {
             canvas.toBlob((blob) => {
@@ -238,6 +270,7 @@ export function createPosterRenderer(): PosterRenderer {
       lifetime.abort();
       assets.dispose();
       layouts.clear();
+      if (stagingCanvas) stagingCanvas.width = stagingCanvas.height = 0;
     },
   };
 }

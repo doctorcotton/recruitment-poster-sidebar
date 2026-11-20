@@ -18,10 +18,21 @@ import type {
   TemplateSource,
 } from "./domain/types";
 import { PosterError } from "./domain/types";
-import { moveTextBox, resizeTextBox } from "./domain/geometry";
+import { moveTextBox, normalizeTextBox, resizeTextBox } from "./domain/geometry";
 import { createRepository, createPosterAsset } from "./data";
 import { scopeValues } from "./domain/field-binding";
-import { PRESET_FONT, withPresetFonts, loadDefaultBundle } from "./data/preset-fonts";
+import {
+  PRESET_FONT,
+  TITLE_PRESET_FONT,
+  withPresetFonts,
+  loadDefaultBundle,
+  prefetchPresetFont,
+  hasPresetFontSubset,
+  promotePresetFont,
+  withCompletePresetFont,
+  loadPresetFontUpgrade,
+  loadTitlePresetFont,
+} from "./data/preset-fonts";
 import { withSourceBackground } from "./application/source-background";
 import { createPosterRenderer } from "./rendering/canvas";
 import { loadWorkspaceBootstrap } from "./domain/workspace-bootstrap";
@@ -86,6 +97,11 @@ function downloadBlob(blob: Blob, name: string) {
   link.download = name;
   link.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+/** 逐字段比较；并集覆盖新出现的可选键（如首次打开斜体）。 */
+function sameTextBox(a: TextBox, b: TextBox): boolean {
+  const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+  return [...keys].every((key) => a[key as keyof TextBox] === b[key as keyof TextBox]);
 }
 
 type PendingNavigation = { title: string; action: () => Promise<void> | void };
@@ -238,22 +254,32 @@ export default function App() {
       backgroundKey,
       prepareBundle: withPresetFonts,
       onRestore: (loaded) => {
-        setTemplate(loaded.template);
+        const stamp = JSON.stringify(loaded.template);
+        // 多条记录常共用同一模板行：画布内容本来就一致时只同步素材与基线，
+        // 不清空撤销栈、不把选中框拽回第一个框。
+        if (stamp !== templateStamp) {
+          setTemplate(loaded.template);
+          selectCanvasBox(loaded.template.boxes[0]?.id ?? null);
+          history.current = { undo: [], redo: [] };
+        }
         setAssets(loaded.assets);
-        setSavedStamp(JSON.stringify(loaded.template));
+        setSavedStamp(stamp);
         setTemplateRevision(loaded.revision ?? 0);
-        selectCanvasBox(loaded.template.boxes[0]?.id ?? null);
-        history.current = { undo: [], redo: [] };
       },
       onNewSource: (next, warning) => {
         // 新来源保留当前版式作为草稿，但底图和基线都换成该模板行的真实数据。
         if (next) {
-          setTemplate(next.template);
+          const stamp = JSON.stringify(next.template);
+          // 同一模板行的多条记录内容一致：不重建画布，保留选中图层与撤销栈。
+          if (stamp !== templateStamp) setTemplate(next.template);
           setAssets(next.assets);
+          setTemplateRevision(null);
+          // 被动切换来源本身不是用户修改：以换底图后的版式为基线，只有后续真实编辑才算未保存。
+          setSavedStamp(stamp);
+        } else {
+          setTemplateRevision(null);
+          setSavedStamp(templateStamp);
         }
-        setTemplateRevision(null);
-        // 被动切换来源本身不是用户修改：以换底图后的版式为基线，只有后续真实编辑才算未保存。
-        setSavedStamp(next ? JSON.stringify(next.template) : templateStamp);
         if (warning) setNotice({ kind: "warning", text: warning });
       },
       draftBundle: () => bundle,
@@ -274,6 +300,15 @@ export default function App() {
   }, [record, editingSource, templatePageRowValues, templateRecord, emptyValues]);
   const stageBundle = bundle;
   const fontAssets = assets.filter((asset) => template?.fontIds.includes(asset.id));
+  const fontOptions = fontAssets.map(({ id, name }) => ({
+    value: id,
+    label:
+      [PRESET_FONT, TITLE_PRESET_FONT].find((font) => font.id === id)?.label ??
+      name.replace(/\.(otf|ttf|woff2?)$/i, ""),
+  }));
+  if (!fontOptions.some((option) => option.value === TITLE_PRESET_FONT.id)) {
+    fontOptions.push({ value: TITLE_PRESET_FONT.id, label: TITLE_PRESET_FONT.label });
+  }
   const dirty = hasUnsavedChanges({
     templateStamp: template ? templateStamp : "",
     baselineStamp: savedStamp,
@@ -310,8 +345,7 @@ export default function App() {
     fields: context?.fields ?? [],
     templateFields,
     templateTableId,
-    fontAssets,
-    presetFont: PRESET_FONT,
+    fontOptions,
     disabled: controlsDisabled || Boolean(selected?.locked),
     canDownload: actions.canPreview,
     onClose: closeProperties,
@@ -319,10 +353,34 @@ export default function App() {
     onDelete: deleteBox,
     onAdd: addBox,
     onChange: changeBox,
+    onFontChange: changeFont,
     onDownload: () => previewPng(true),
   };
 
   useEffect(() => observeSemiA11y(), []);
+
+  // 首屏先用常用字子集出图；完整字体到货后替换素材，画布随之重绘一次。
+  useEffect(() => {
+    if (!hasPresetFontSubset(assets)) return;
+    let disposed = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const upgrade = (attemptsLeft: number) => {
+      void loadPresetFontUpgrade()
+        .then((full) => {
+          if (!disposed) setAssets((current) => promotePresetFont(current, full));
+        })
+        .catch(() => {
+          // 完整字体失败时画面停在子集上；隔一会儿自动再试一次，不让用户手动刷。
+          if (disposed || attemptsLeft <= 0) return;
+          timer = setTimeout(() => upgrade(attemptsLeft - 1), 2000);
+        });
+    };
+    upgrade(1);
+    return () => {
+      disposed = true;
+      clearTimeout(timer);
+    };
+  }, [assets]);
 
   // 模板列表统一两个数据源：启用模板表时列模板行，否则列本地/独立模板库。
   const templateListRows = useMemo<TemplateRowSummary[]>(
@@ -417,9 +475,11 @@ export default function App() {
         templateBackgroundFieldId,
       );
       if (disposed) return;
-      const rowValues = await repository.loadTemplateRecord(source);
-      if (disposed) return;
-      const saved = await repository.loadSourceTemplate(source);
+      // 行值与已保存配置互不依赖，并行读取可省掉一次串行往返。
+      const [rowValues, saved] = await Promise.all([
+        repository.loadTemplateRecord(source),
+        repository.loadSourceTemplate(source),
+      ]);
       if (disposed) return;
       if (saved) {
         const loaded = await withPresetFonts(saved);
@@ -553,6 +613,8 @@ export default function App() {
 
   async function openWorkspace(tableId: string, configTableId = storageChoice, restoring = false) {
     if (!tableId || !configTableId || tableId === configTableId) return;
+    // 字体体积最大也最先用得上：与后面的元数据、记录读取并行下载，不排在串行往返之后。
+    prefetchPresetFont();
     await run("open-table", async () => {
       // 业务表和配置表分别指定；只有用户明确选择"新建"才允许创建配置表。
       const storage = await repository.initializeStorage(
@@ -753,24 +815,30 @@ export default function App() {
   }
   function edit(change: (current: PosterTemplate) => PosterTemplate, remember = true) {
     if (!template || editorDisabled) return;
+    const next = change(template);
+    // 没有实际变化就不记历史、不重渲染，拖拽每帧的重复事件不会撑大撤销栈。
+    if (next === template) return;
     if (remember) checkpoint();
-    setTemplate(change(template));
+    setTemplate(next);
   }
   function changeBox(id: string, updates: Partial<TextBox>, remember = false) {
-    if (template?.boxes.find((box) => box.id === id)?.locked) return;
-    edit(
-      (current) => ({
-        ...current,
-        boxes: current.boxes.map((box) => {
-          if (box.id !== id) return box;
-          const next = { ...box, ...updates };
-          next.minFontSize = Math.min(next.minFontSize, next.fontSize);
-          const sized = resizeTextBox(next, next.width, next.height, current);
-          return moveTextBox(sized, 0, 0, current);
-        }),
-      }),
-      remember,
-    );
+    edit((current) => {
+      const box = current.boxes.find((item) => item.id === id);
+      if (!box || box.locked) return current;
+      // 面板、拖拽、缩放手柄和键盘微调都经过同一个量化与边界收拢点。
+      const normalized = normalizeTextBox({ ...box, ...updates });
+      const next = moveTextBox(
+        resizeTextBox(normalized, normalized.width, normalized.height, current),
+        0,
+        0,
+        current,
+      );
+      // 可选字段（斜体等）首次设置会新增键，比较必须覆盖两边的键并集。
+      const unchanged = sameTextBox(box, next);
+      return unchanged
+        ? current
+        : { ...current, boxes: current.boxes.map((item) => (item.id === id ? next : item)) };
+    }, remember);
   }
   function selectLayer(id: string) {
     setSelectedId(id);
@@ -904,6 +972,8 @@ export default function App() {
   async function save(): Promise<boolean> {
     if (!bundle) return false;
     return await run("save", async () => {
+      // 子集字体只用于预览：落库前必须换成完整字体，否则以后打开只剩常用字。
+      const savedBundle = await withCompletePresetFont(bundle);
       if (templateFieldId) {
         if (!templateBackgroundFieldId)
           throw new Error("请先在「设置」里选择模板底图字段，再保存模板");
@@ -911,7 +981,7 @@ export default function App() {
           throw new Error(templatePageError || sourceError || "模板行还未就绪，请等待或刷新");
         const revision = await repository.saveSourceTemplate(
           editingSource,
-          bundle,
+          savedBundle,
           templateRevision,
         );
         setTemplateRevision(revision);
@@ -921,7 +991,7 @@ export default function App() {
             await repository.listTemplateRows(templateTableId, templateBackgroundFieldId),
           );
       } else {
-        const summary = await repository.saveTemplate(bundle, templateRevision);
+        const summary = await repository.saveTemplate(savedBundle, templateRevision);
         setTemplateRevision(summary.updatedAt);
         setTemplates(await repository.listTemplates());
       }
@@ -1090,6 +1160,26 @@ export default function App() {
     selectCanvasBox(null);
   }
 
+  function attachFont(asset: PosterAsset, boxId: string | null) {
+    edit((current) => ({
+      ...current,
+      fontIds: Array.from(new Set([...current.fontIds, asset.id])),
+      boxes: current.boxes.map((box) => (box.id === boxId ? { ...box, fontId: asset.id } : box)),
+    }));
+    setAssets((current) => [...current.filter((item) => item.id !== asset.id), asset]);
+  }
+
+  function changeFont(boxId: string, fontId: string) {
+    if (editorDisabled || !template?.boxes.some((box) => box.id === boxId && !box.locked)) return;
+    if (fontId === TITLE_PRESET_FONT.id && !fontAssets.some((asset) => asset.id === fontId)) {
+      void run("load-preset-font", async () => {
+        attachFont(await loadTitlePresetFont(), boxId);
+      });
+      return;
+    }
+    changeBox(boxId, { fontId }, true);
+  }
+
   async function upload(file: File | undefined, kind: "background" | "font") {
     if (!file || !template || editorDisabled) return;
     await run(kind, async () => {
@@ -1102,18 +1192,7 @@ export default function App() {
         } catch {
           throw new Error("字体文件无法读取，请选择有效的 OTF、TTF、WOFF 或 WOFF2 字体");
         }
-        checkpoint();
-        setTemplate((current) =>
-          current
-            ? {
-                ...current,
-                fontIds: Array.from(new Set([...current.fontIds, asset.id])),
-                boxes: current.boxes.map((box) =>
-                  box.id === selectedId ? { ...box, fontId: asset.id } : box,
-                ),
-              }
-            : current,
-        );
+        attachFont(asset, selectedId);
       } else {
         const bitmap = await createImageBitmap(asset.blob);
         const width = bitmap.width,
@@ -1131,20 +1210,24 @@ export default function App() {
                 width,
                 height,
                 backgroundId: asset.id,
-                boxes: current.boxes.map((box) => ({
-                  ...box,
-                  x: box.x * sx,
-                  y: box.y * sy,
-                  width: box.width * sx,
-                  height: box.height * sy,
-                  fontSize: Math.max(8, box.fontSize * sx),
-                  minFontSize: Math.max(8, box.minFontSize * sx),
-                })),
+                // 换底图时文字框跟着画布等比缩放，量化规则与手工编辑保持一致。
+                boxes: current.boxes.map((box) => {
+                  const scaled = normalizeTextBox({
+                    ...box,
+                    x: box.x * sx,
+                    y: box.y * sy,
+                    width: box.width * sx,
+                    height: box.height * sy,
+                    fontSize: Math.max(8, box.fontSize * sx),
+                    minFontSize: Math.max(8, box.minFontSize * sx),
+                  });
+                  return moveTextBox(scaled, 0, 0, { width, height });
+                }),
               }
             : current,
         );
+        setAssets((current) => [...current.filter((item) => item.id !== asset.id), asset]);
       }
-      setAssets((current) => [...current.filter((item) => item.id !== asset.id), asset]);
       setNotice({ kind: "success", text: kind === "font" ? "字体已加载" : "底图已更新" });
     });
   }
@@ -1153,7 +1236,8 @@ export default function App() {
     if (!bundle) return;
     await run("export-template", async () => {
       const { createTemplatePackage } = await import("./application/template-package");
-      const packed = await createTemplatePackage(bundle);
+      // 导出的模板包要带完整字体，不能把预览子集发给别人。
+      const packed = await createTemplatePackage(await withCompletePresetFont(bundle));
       downloadBlob(packed, `${safeFilename(bundle.template.name)}.poster.zip`);
       setNotice({ kind: "success", text: "模板包已导出，包含声明 JSON 和原始素材" });
     });
@@ -1197,7 +1281,8 @@ export default function App() {
         throw new Error(templatePageError || sourceError || "模板行正在定位，请稍后重试");
       if (templateFieldId && !record) throw new Error("请先选择一条记录");
       if (!stageBundle) throw new Error("海报还没有可用的底图");
-      const blob = await renderer.png(stageBundle, values);
+      // PNG 必须用完整字体：预览可能还停在常用字子集上。
+      const blob = await renderer.png(await withCompletePresetFont(stageBundle), values);
       if (download) downloadBlob(blob, `${safeFilename(template!.name)}.png`);
       else setPreview({ url: URL.createObjectURL(blob), blob });
     });
@@ -1258,7 +1343,8 @@ export default function App() {
             if (!saved) throw new Error(`模板“${source.recordName}”尚未保存，请先选择并保存该模板`);
             return saved;
           },
-          resolveBundle: async (_row, rowTemplate) => rowTemplate,
+          // 逐行渲染同样要完整字体，避免写回的海报只有常用字。
+          resolveBundle: async (_row, rowTemplate) => withCompletePresetFont(rowTemplate),
           readOutputVersion: (row) =>
             repository.readOutputVersion(row.id, targetFieldId, taskContext.tableId),
           render: (row, resolved, signal) =>

@@ -1222,6 +1222,11 @@ h3 {
   color: #667981;
   text-align: center;
 }
+.text-style-row {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 14px;
+}
 .font-color-settings {
   display: flex;
   gap: 6px;

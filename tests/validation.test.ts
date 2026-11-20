@@ -122,6 +122,17 @@ test("图层可声明绑定表；缺省沿用数据表，非法值拒绝", () =>
   assert.equal("fieldTableId" in validateTemplate(legacy).boxes[0], false);
 });
 
+test("斜体是可选声明，非布尔值拒绝", () => {
+  invalid((value) => {
+    value.boxes[0].italic = "yes";
+  });
+  const italic = structuredClone(DEFAULT_TEMPLATE);
+  italic.boxes[0].italic = true;
+  assert.equal(validateTemplate(italic).boxes[0].italic, true);
+  // 旧模板没有该字段时不凭空写出，避免每次保存都改动 JSON。
+  assert.equal("italic" in validateTemplate(structuredClone(DEFAULT_TEMPLATE)).boxes[0], false);
+});
+
 test("字号、行高、最大行数和对齐均校验", () => {
   invalid((value) => {
     value.boxes[0].minFontSize = value.boxes[0].fontSize + 1;

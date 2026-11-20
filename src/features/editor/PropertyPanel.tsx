@@ -1,9 +1,11 @@
 import type { RefObject } from "react";
-import { Button, Input, InputNumber, Select, TextArea } from "../../ui/semi";
+import { Button, Input, Select, TextArea } from "../../ui/semi";
 import { IconCopy, IconDelete, IconDownload, IconPlus } from "@douyinfe/semi-icons";
-import type { PosterAsset, TableField, TextBox } from "../../domain/types";
+import type { TableField, TextBox } from "../../domain/types";
+import { BOX_PRECISION } from "../../domain/geometry";
 import { bindingOptionsOf, bindingPatchOf, bindingValueOf, boundFieldOf } from "./binding-options";
 import { FontHexInput } from "../../ui/FontHexInput";
+import { NumberField } from "../../ui/NumberField";
 
 interface Props {
   panelRef: RefObject<HTMLElement | null>;
@@ -13,8 +15,7 @@ interface Props {
   fields: TableField[];
   templateFields: TableField[];
   templateTableId: string | null;
-  fontAssets: PosterAsset[];
-  presetFont: { id: string; label: string };
+  fontOptions: { value: string; label: string }[];
   disabled: boolean;
   canDownload: boolean;
   /** 嵌在模板页右栏 tab 内时为 true。 */
@@ -24,12 +25,13 @@ interface Props {
   onDelete(): void;
   onAdd(): void;
   onChange(id: string, updates: Partial<TextBox>, remember?: boolean): void;
+  onFontChange(boxId: string, fontId: string): void;
   onDownload(): void;
 }
 
 /** 固定侧栏与右键浮窗共用一份文字属性控件。 */
 export function PropertyPanel(props: Props) {
-  const { panelRef, popup, selected, values, fields, fontAssets, presetFont, disabled } = props;
+  const { panelRef, popup, selected, values, fields, fontOptions, disabled } = props;
   // 绑定下拉与映射页共用同一份选项；这里只改当前图层的绑定。
   const bindingSource = {
     fields,
@@ -149,28 +151,23 @@ export function PropertyPanel(props: Props) {
             <div className="number-grid">
               {(
                 [
-                  ["x", "X"],
-                  ["y", "Y"],
-                  ["width", "宽度"],
-                  ["height", "高度"],
+                  ["x", "X", 0],
+                  ["y", "Y", 0],
+                  ["width", "宽度", 1],
+                  ["height", "高度", 1],
                 ] as const
-              ).map(([key, label]) => (
+              ).map(([key, label, min]) => (
                 <label key={key} className="control-label">
                   {label}
-                  <InputNumber
-                    aria-label={`文字框${label}`}
-                    value={Math.round(selected[key] * 10) / 10}
-                    precision={1}
-                    step={0.1}
-                    min={key === "width" || key === "height" ? 24 : 0}
-                    onChange={(value) =>
-                      typeof value === "number" &&
-                      value !== Math.round(selected[key] * 10) / 10 &&
-                      props.onChange(selected.id, { [key]: value }, true)
-                    }
+                  <NumberField
+                    label={`文字框${label}`}
+                    // 步进按 1px 走，允许保留 0.1px 小数，与画布内拖拽一致。
+                    step={1}
+                    precision={BOX_PRECISION.position}
+                    min={min}
+                    value={selected[key]}
+                    onChange={(value) => props.onChange(selected.id, { [key]: value }, true)}
                     disabled={disabled}
-                    hideButtons
-                    style={{ width: "100%" }}
                   />
                 </label>
               ))}
@@ -183,82 +180,78 @@ export function PropertyPanel(props: Props) {
               <Select
                 aria-labelledby="font-field-label"
                 value={selected.fontId}
-                optionList={fontAssets.map((asset) => ({
-                  label:
-                    asset.id === presetFont.id
-                      ? presetFont.label
-                      : asset.name.replace(/\.(otf|ttf|woff2?)$/i, ""),
-                  value: asset.id,
-                }))}
-                onChange={(fontId) => props.onChange(selected.id, { fontId: String(fontId) }, true)}
+                optionList={fontOptions}
+                onChange={(fontId) => props.onFontChange(selected.id, String(fontId))}
                 disabled={disabled}
                 style={{ width: "100%" }}
               />
             </label>
+            <div className="text-style-row">
+              {/* 字体文件只有常规面，斜体由渲染层合成倾斜。 */}
+              <Button
+                size="small"
+                theme={selected.italic === true ? "solid" : "light"}
+                aria-pressed={selected.italic === true}
+                disabled={disabled}
+                onClick={() =>
+                  props.onChange(selected.id, { italic: selected.italic !== true }, true)
+                }
+              >
+                斜体
+              </Button>
+            </div>
             <div className="number-grid">
               <label className="control-label">
                 字号
-                <InputNumber
-                  aria-label="文字字号"
-                  value={Math.round(selected.fontSize)}
+                <NumberField
+                  label="文字字号"
+                  step={1}
+                  precision={BOX_PRECISION.fontSize}
                   min={8}
                   max={300}
+                  value={selected.fontSize}
+                  onChange={(value) => props.onChange(selected.id, { fontSize: value }, true)}
                   disabled={disabled}
-                  onChange={(value) =>
-                    typeof value === "number" &&
-                    props.onChange(selected.id, { fontSize: value }, true)
-                  }
-                  hideButtons
-                  style={{ width: "100%" }}
                 />
               </label>
               <label className="control-label">
                 最小字号
-                <InputNumber
-                  aria-label="最小字号"
-                  value={Math.round(selected.minFontSize)}
+                <NumberField
+                  label="最小字号"
+                  step={1}
+                  precision={BOX_PRECISION.fontSize}
                   min={8}
-                  max={selected.fontSize}
+                  // 最小字号不能超过当前字号，避免排版搜索区间反向。
+                  max={Math.max(8, selected.fontSize)}
+                  value={selected.minFontSize}
+                  onChange={(value) => props.onChange(selected.id, { minFontSize: value }, true)}
                   disabled={disabled}
-                  onChange={(value) =>
-                    typeof value === "number" &&
-                    props.onChange(selected.id, { minFontSize: value }, true)
-                  }
-                  hideButtons
-                  style={{ width: "100%" }}
                 />
               </label>
               <label className="control-label">
                 行数上限
-                <InputNumber
-                  aria-label="行数上限"
-                  value={Math.round(selected.maxLines)}
+                <NumberField
+                  label="行数上限"
+                  step={1}
+                  precision={0}
                   min={1}
                   max={20}
+                  value={selected.maxLines}
+                  onChange={(value) => props.onChange(selected.id, { maxLines: value }, true)}
                   disabled={disabled}
-                  onChange={(value) =>
-                    typeof value === "number" &&
-                    props.onChange(selected.id, { maxLines: Math.round(value) }, true)
-                  }
-                  hideButtons
-                  style={{ width: "100%" }}
                 />
               </label>
               <label className="control-label">
                 行距
-                <InputNumber
-                  aria-label="文字行距"
-                  value={selected.lineHeight}
+                <NumberField
+                  label="文字行距"
+                  step={0.1}
+                  precision={BOX_PRECISION.lineHeight}
                   min={1}
                   max={3}
-                  step={0.1}
+                  value={selected.lineHeight}
+                  onChange={(value) => props.onChange(selected.id, { lineHeight: value }, true)}
                   disabled={disabled}
-                  onChange={(value) =>
-                    typeof value === "number" &&
-                    props.onChange(selected.id, { lineHeight: value }, true)
-                  }
-                  hideButtons
-                  style={{ width: "100%" }}
                 />
               </label>
             </div>

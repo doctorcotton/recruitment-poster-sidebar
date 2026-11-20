@@ -119,13 +119,37 @@ export class FeishuPosterRepository implements PosterRepository {
   private configuredSettingsTableId?: string;
   private baseId?: string | null;
   private cache: RequestCache;
+  /**
+   * 附件字节常驻缓存：键里已经带上附件快照（token / 大小 / 时间戳）或内容哈希，
+   * 同一份字节永远是对的，因此不受 TTL 与“保存后失效”影响，
+   * 只由 LRU 的条目数与字节上限淘汰。切走再切回同一模板行不会重新下载。
+   */
+  private assetCache: RequestCache;
   constructor(private readonly options: FeishuRepositoryOptions = {}) {
     this.cache = new RequestCache(options);
+    this.assetCache = this.createAssetCache();
   }
 
+  private createAssetCache(): RequestCache {
+    const { options } = this;
+    return new RequestCache({
+      ...options,
+      ttlMs: Number.POSITIVE_INFINITY,
+      // 常驻缓存按字节淘汰；放入几套模板的底图与字体，仍受上限约束。
+      maxBytes: options.maxBytes ?? 48 * 1024 * 1024,
+    });
+  }
+
+  /** 刷新元数据：配置、记录和字段会变，按内容快照命中的附件字节留着。 */
   invalidate(): void {
     this.cache.invalidate();
     this.cache = new RequestCache(this.options);
+  }
+
+  /** 换 Base 时连素材一起丢：表 ID 跨 Base 可能重名，不能借用别的 Base 的字节。 */
+  private invalidateAll(): void {
+    this.invalidate();
+    this.assetCache = this.createAssetCache();
   }
 
   private cached<T>(
@@ -307,7 +331,7 @@ export class FeishuPosterRepository implements PosterRepository {
       if (!tableId || (explicitTableId === undefined && !viewId))
         throw new PosterError("PLATFORM_ERROR", "请在多维表数据视图中打开招聘海报边栏。");
       const previousCache = this.cache;
-      if (this.baseId !== undefined && this.baseId !== selection.baseId) this.invalidate();
+      if (this.baseId !== undefined && this.baseId !== selection.baseId) this.invalidateAll();
       this.baseId = selection.baseId;
       // 自身切换 Base 时使用新代；外部刷新已淘汰的旧调用仍停留在旧代。
       if (cache === previousCache) cache = this.cache;
@@ -342,8 +366,21 @@ export class FeishuPosterRepository implements PosterRepository {
 
   private recordFields(table: SdkTable, cache: RequestCache) {
     return cache.get(JSON.stringify(["record-fields", table.id]), async () =>
-      (await table.getFieldMetaList()).map(toTableField),
+      (await this.fieldMeta(table, cache)).map(toTableField),
     );
+  }
+
+  /** 同一切换里定位来源、读行值与读配置都要字段元数据，缓存后只请求宿主一次。 */
+  private fieldMeta(table: SdkTable, cache: RequestCache): Promise<SdkFieldMeta[]> {
+    return cache.get(JSON.stringify(["field-meta", table.id]), () => table.getFieldMetaList());
+  }
+
+  /**
+   * 行数据始终直读宿主：底图、文案和配置都可能被其他人改动，
+   * 缓存会让人看不到变化。省下的往返由调用方并行读取完成。
+   */
+  private templateRow(table: SdkTable, recordId: string): ReturnType<SdkTable["getRecordById"]> {
+    return table.getRecordById(recordId);
   }
 
   listRecords(
@@ -361,9 +398,9 @@ export class FeishuPosterRepository implements PosterRepository {
   }
 
   loadBackground(recordId: string, fieldId: string, tableId: string): Promise<PosterAsset> {
-    const cache = this.cache;
+    const { cache, assetCache } = this;
     return this.run("读取行底图", (sdk) =>
-      this.readBackground(sdk, recordId, fieldId, tableId, cache),
+      this.readBackground(sdk, recordId, fieldId, tableId, cache, assetCache),
     );
   }
 
@@ -373,19 +410,23 @@ export class FeishuPosterRepository implements PosterRepository {
     fieldId: string,
     tableId: string,
     cache: RequestCache,
+    assetCache: RequestCache,
   ): Promise<PosterAsset> {
     const table = await sdk.base.getTableById(tableId);
-    const field = (await table.getFieldMetaList()).find((item) => item.id === fieldId);
+    const [fields, record] = await Promise.all([
+      this.fieldMeta(table, cache),
+      this.templateRow(table, recordId),
+    ]);
+    const field = fields.find((item) => item.id === fieldId);
     if (field?.type !== FIELD_TYPES.attachment && field?.type !== FIELD_TYPES.lookup) {
       throw new PosterError("INVALID_ASSET", "底图必须选择附件或附件查找引用字段。");
     }
-    const record = await table.getRecordById(recordId);
     return this.downloadRecordBackground(
       table,
       recordId,
       fieldId,
       backgroundAttachment(record.fields[fieldId]),
-      cache,
+      assetCache,
     );
   }
 
@@ -394,10 +435,10 @@ export class FeishuPosterRepository implements PosterRepository {
     recordId: string,
     fieldId: string,
     attachment: SdkAttachment,
-    cache: RequestCache,
+    assetCache: RequestCache,
   ): Promise<PosterAsset> {
     // 用当前记录的附件快照定位字节，命中时无需向宿主申请临时 URL。
-    const asset = await cache.get(
+    const asset = await assetCache.get(
       JSON.stringify([
         "background",
         table.id,
@@ -426,7 +467,7 @@ export class FeishuPosterRepository implements PosterRepository {
     const cache = this.cache;
     return this.run("定位模板行", async (sdk) => {
       const table = await sdk.base.getTableById(tableId);
-      const fields = await table.getFieldMetaList();
+      const fields = await this.fieldMeta(table, cache);
       const locator = fields.find((item) => item.id === locatorFieldId);
       if (locator?.type !== FIELD_TYPES.lookup)
         throw new PosterError("INVALID_TEMPLATE", "模板定位字段必须是查找引用字段。");
@@ -451,7 +492,7 @@ export class FeishuPosterRepository implements PosterRepository {
         );
 
       const templateTable = await sdk.base.getTableById(property.refTableId);
-      const templateFields = await templateTable.getFieldMetaList();
+      const templateFields = await this.fieldMeta(templateTable, cache);
       if (!templateFields.some((item) => item.id === keyFieldId))
         throw new PosterError("INVALID_TEMPLATE", "查找引用指向的模板字段已不存在，请重建该字段。");
       if (
@@ -493,26 +534,33 @@ export class FeishuPosterRepository implements PosterRepository {
   }
 
   loadSourceBackground(source: TemplateSource): Promise<PosterAsset> {
-    const cache = this.cache;
+    const { cache, assetCache } = this;
     return this.run("读取模板底图", async (sdk) => {
-      const { table, attachment } = await this.sourceTarget(sdk, source);
+      const { table, attachment } = await this.sourceTarget(sdk, source, cache);
       return this.downloadRecordBackground(
         table,
         source.recordId,
         source.backgroundFieldId,
         attachment,
-        cache,
+        assetCache,
       );
     });
   }
 
   loadTemplateRecord(source: TemplateSource): Promise<TemplateRecordValues> {
+    const cache = this.cache;
     return this.run("读取模板行", async (sdk) => {
       const table = await sdk.base.getTableById(source.tableId);
-      const fields = (await table.getFieldMetaList()).map(toTableField);
-      const record = await table.getRecordById(source.recordId);
-      const { values } = toDataRecord({ recordId: source.recordId, fields: record.fields }, fields);
-      return { fields, values };
+      const [fields, record] = await Promise.all([
+        this.fieldMeta(table, cache),
+        this.templateRow(table, source.recordId),
+      ]);
+      const tableFields = fields.map(toTableField);
+      const { values } = toDataRecord(
+        { recordId: source.recordId, fields: record.fields },
+        tableFields,
+      );
+      return { fields: tableFields, values };
     });
   }
 
@@ -520,9 +568,10 @@ export class FeishuPosterRepository implements PosterRepository {
     templateTableId: string,
     backgroundFieldId: string,
   ): Promise<TemplateRowSummary[]> {
+    const cache = this.cache;
     return this.run("读取模板行列表", async (sdk) => {
       const table = await sdk.base.getTableById(templateTableId);
-      const fields = await table.getFieldMetaList();
+      const fields = await this.fieldMeta(table, cache);
       this.assertTemplateBackgroundField(fields, backgroundFieldId);
       const tableFields = fields.map(toTableField);
       const { configField } = this.sourceColumns(fields);
@@ -540,14 +589,18 @@ export class FeishuPosterRepository implements PosterRepository {
     recordId: string,
     backgroundFieldId: string,
   ): Promise<TemplateSource> {
+    const cache = this.cache;
     return this.run("读取模板行来源", async (sdk) => {
       const table = await sdk.base.getTableById(templateTableId);
-      const fields = await table.getFieldMetaList();
+      const [fields, record, tableName] = await Promise.all([
+        this.fieldMeta(table, cache),
+        this.templateRow(table, recordId),
+        table.getName(),
+      ]);
       this.assertTemplateBackgroundField(fields, backgroundFieldId);
-      const record = await table.getRecordById(recordId);
       return {
         tableId: table.id,
-        tableName: await table.getName(),
+        tableName,
         recordId,
         recordName: recordLabel(record, fields.map(toTableField)),
         backgroundFieldId,
@@ -565,9 +618,12 @@ export class FeishuPosterRepository implements PosterRepository {
     }
   }
 
-  private async sourceTarget(sdk: FeishuSdkFacade, source: TemplateSource) {
+  private async sourceTarget(sdk: FeishuSdkFacade, source: TemplateSource, cache?: RequestCache) {
     const table = await sdk.base.getTableById(source.tableId);
-    const fields = await table.getFieldMetaList();
+    // 读取可以复用字段缓存；写入先确认最新列，再读取行内的修订号。
+    const [fields, record] = cache
+      ? await Promise.all([this.fieldMeta(table, cache), this.templateRow(table, source.recordId)])
+      : [await table.getFieldMetaList(), await this.templateRow(table, source.recordId)];
     if (
       !fields.some(
         (field) => field.id === source.backgroundFieldId && field.type === FIELD_TYPES.attachment,
@@ -575,7 +631,6 @@ export class FeishuPosterRepository implements PosterRepository {
     ) {
       throw new PosterError("INVALID_TEMPLATE", "模板行必须选择模板表里的底图附件字段。");
     }
-    const record = await table.getRecordById(source.recordId);
     const attachment = backgroundAttachment(record.fields[source.backgroundFieldId]);
     return { table, fields, record, attachment };
   }
@@ -613,7 +668,7 @@ export class FeishuPosterRepository implements PosterRepository {
     fieldId: string,
     tokens: string[],
     manifest: SavedAsset[],
-    cache: RequestCache,
+    assetCache: RequestCache,
   ): Promise<PosterAsset[]> {
     const positions = new Map(tokens.map((token, i) => [token, i]));
     let urls: Promise<string[]> | undefined;
@@ -623,7 +678,8 @@ export class FeishuPosterRepository implements PosterRepository {
       const position = positions.get(asset.token);
       if (position === undefined)
         throw new PosterError("INVALID_ASSET", `模板素材“${asset.name}”附件已缺失。`);
-      const blob = await cache.get(
+      // 键含内容哈希：同一份字节在不同行、不同时间都直接复用。
+      const blob = await assetCache.get(
         JSON.stringify(["asset", table.id, fieldId, asset.token, asset.hash, asset.mimeType]),
         async () => {
           urls ??= table.getCellAttachmentUrls(tokens, fieldId, recordId);
@@ -647,9 +703,9 @@ export class FeishuPosterRepository implements PosterRepository {
   }
 
   loadSourceTemplate(source: TemplateSource): Promise<TemplateBundle | null> {
-    const cache = this.cache;
+    const { cache, assetCache } = this;
     return this.run("读取模板行配置", async (sdk) => {
-      const { table, fields, record, attachment } = await this.sourceTarget(sdk, source);
+      const { table, fields, record, attachment } = await this.sourceTarget(sdk, source, cache);
       const { configField, fontField } = this.sourceColumns(fields);
       if (!configField || !cellText(record.fields[configField]).trim()) return null;
       const config = parseConfig(record.fields[configField]);
@@ -675,14 +731,14 @@ export class FeishuPosterRepository implements PosterRepository {
         fontField,
         tokens,
         config.assets,
-        cache,
+        assetCache,
       );
       const background = await this.downloadRecordBackground(
         table,
         source.recordId,
         source.backgroundFieldId,
         attachment,
-        cache,
+        assetCache,
       );
       const bundle = {
         template: { ...config.template, backgroundId: background.id },
@@ -865,7 +921,7 @@ export class FeishuPosterRepository implements PosterRepository {
   }
 
   loadTemplate(id: string): Promise<TemplateBundle> {
-    const cache = this.cache;
+    const assetCache = this.assetCache;
     return this.run("读取模板", async (sdk) => {
       const target = await this.templateTable(sdk);
       const row =
@@ -880,7 +936,7 @@ export class FeishuPosterRepository implements PosterRepository {
         target.assetField,
         tokens,
         row.config.assets,
-        cache,
+        assetCache,
       );
       const bundle = { template: row.config.template, assets, revision: row.config.updatedAt };
       validateBundle(bundle);

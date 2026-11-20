@@ -41,6 +41,8 @@ function setupBrowser(t: TestContext) {
     context = {
       drawImage: t.mock.fn(),
       scale: t.mock.fn(),
+      setTransform: t.mock.fn(),
+      clearRect: t.mock.fn(),
       save() {},
       restore() {},
       beginPath() {},
@@ -165,7 +167,8 @@ test("超大预览限尺寸、沿用原稿坐标与溢出判定，PNG 保留原�
   assert.deepEqual((await preview).overflowBoxIds, ["job"]);
   assert.deepEqual([target.width, target.height], [1463, 2048]);
   assert.deepEqual(canvases[0].context.scale.mock.calls[0].arguments, [1463 / 5000, 2048 / 7000]);
-  assert.deepEqual([canvases[0].width, canvases[0].height], [0, 0]);
+  // 离屏画布跨帧复用，缓冲留在原位；每帧重建会重复分配几十 MB 像素。
+  assert.deepEqual([canvases[0].width, canvases[0].height], [1463, 2048]);
   await assert.rejects(renderer.png(data, overflowValues), { code: "TEXT_OVERFLOW" });
   assert.equal(canvases.length, 2);
   assert.equal(canvases[1].encode, undefined);
@@ -177,6 +180,63 @@ test("超大预览限尺寸、沿用原稿坐标与溢出判定，PNG 保留原�
   canvases[2].encode?.(blob);
   assert.equal(await output, blob);
   assert.deepEqual([canvases[2].width, canvases[2].height], [0, 0]);
+});
+
+test("连续预览复用同一离屏画布，目标缓冲按显示尺寸取位图", async (t) => {
+  const { renderer, TestCanvas, images, canvases } = setupBrowser(t);
+  const target = new TestCanvas();
+  const data = bundle();
+  const first = renderer.draw(
+    asCanvas(target),
+    data,
+    { job: "第一帧" },
+    { preview: true, maxSide: 640 },
+  );
+  images[0].onload?.();
+  await first;
+  await renderer.draw(asCanvas(target), data, { job: "第二帧" }, { preview: true, maxSide: 640 });
+  // 两帧只创建一个离屏画布，位图长边等于显示像素而不是 2048 上限。
+  assert.equal(canvases.length, 1);
+  assert.deepEqual([canvases[0].width, canvases[0].height], [317, 640]);
+  assert.deepEqual([target.width, target.height], [317, 640]);
+  assert.equal(target.context.drawImage.mock.callCount(), 2);
+  // 每帧先清空目标再合成，透明区域不会残留上一帧。
+  assert.equal(target.context.clearRect.mock.callCount(), 2);
+});
+
+test("并发预览分别复制自己的文案和位图尺寸", async (t) => {
+  const { renderer, TestCanvas, images, canvases } = setupBrowser(t);
+  const firstTarget = new TestCanvas();
+  const secondTarget = new TestCanvas();
+  const data = bundle();
+  const copiedTexts = new Map<InstanceType<typeof TestCanvas>, string | undefined>();
+  for (const target of [firstTarget, secondTarget]) {
+    // drawImage 同步读取源像素，在复制时记录离屏画布最后绘制的文案。
+    target.context.drawImage.mock.mockImplementation((source: InstanceType<typeof TestCanvas>) => {
+      copiedTexts.set(target, drawnTexts([source]).at(-1));
+    });
+  }
+  const first = renderer.draw(
+    asCanvas(firstTarget),
+    data,
+    { job: "第一张" },
+    { preview: true, maxSide: 640 },
+  );
+  const second = renderer.draw(
+    asCanvas(secondTarget),
+    data,
+    { job: "第二张" },
+    { preview: true, maxSide: 960 },
+  );
+  // 两次绘制共享同一次底图加载，素材就绪后都能继续合成。
+  images[0].onload?.();
+  await Promise.all([first, second]);
+
+  assert.equal(copiedTexts.get(firstTarget), "第一张");
+  assert.equal(copiedTexts.get(secondTarget), "第二张");
+  assert.deepEqual([firstTarget.width, firstTarget.height], [317, 640]);
+  assert.deepEqual([secondTarget.width, secondTarget.height], [475, 960]);
+  assert.equal(canvases.length, 1);
 });
 
 test("位图缓存按真实像素淘汰，释放渲染器取消解码和编码并注销字体", async (t) => {
@@ -196,7 +256,8 @@ test("位图缓存按真实像素淘汰，释放渲染器取消解码和编码�
   const encoding = renderer.png(first, {});
   await nextTask();
   const unfinished = renderer.draw(asCanvas(target), second, {}, { preview: true });
-  assert.ok(canvases[3].encode);
+  // 预览复用一个离屏画布，第二次 png 编码用的是 canvases[1]。
+  assert.ok(canvases[1].encode);
   assert.equal(images.length, 4);
   renderer.dispose();
   await assert.rejects(encoding, { code: "CANCELLED" });
@@ -204,7 +265,7 @@ test("位图缓存按真实像素淘汰，释放渲染器取消解码和编码�
   assert.equal(revokeUrl.mock.callCount(), 4);
   assert.equal(images[3].src, "");
   assert.equal(fonts.size, 0);
-  assert.deepEqual([canvases[3].width, canvases[3].height], [0, 0]);
+  assert.deepEqual([canvases[1].width, canvases[1].height], [0, 0]);
 });
 
 test("字体别名共享同一 Blob 的解码，文档内仅保留最近使用的字体", async (t) => {

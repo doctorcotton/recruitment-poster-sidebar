@@ -1,6 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { fitCanvasScale, moveTextBox, resizeTextBox } from "../src/domain/geometry";
+import {
+  fitCanvasScale,
+  moveTextBox,
+  normalizeTextBox,
+  resizeTextBox,
+} from "../src/domain/geometry";
 import { DEFAULT_TEMPLATE } from "../src/domain/defaults";
 
 const canvas = { width: 100, height: 200 };
@@ -47,4 +52,35 @@ test("非有限输入与无效视口快速失败", () => {
   assert.throws(() => fitCanvasScale(100, 100, 100, 100, -1), RangeError);
   assert.throws(() => moveTextBox(box, NaN, 0, canvas), RangeError);
   assert.throws(() => resizeTextBox(box, Infinity, 20, canvas), RangeError);
+});
+
+test("归一化把浮点噪声收成面板精度，同时保住最小正尺寸", () => {
+  const normalized = normalizeTextBox({
+    ...box,
+    x: 10.2345,
+    y: -3,
+    width: 30.06,
+    height: 0.04,
+    fontSize: 36.6,
+    minFontSize: 40.4,
+    lineHeight: 1.23456,
+    maxLines: 2.6,
+  });
+  assert.deepEqual(
+    [normalized.x, normalized.y, normalized.width, normalized.height],
+    [10.2, 0, 30.1, 1],
+  );
+  assert.deepEqual(
+    [normalized.fontSize, normalized.minFontSize, normalized.lineHeight, normalized.maxLines],
+    [37, 37, 1.23, 3],
+  );
+});
+
+test("归一化不改写原对象、文本和绑定", () => {
+  const before = structuredClone(box);
+  const normalized = normalizeTextBox({ ...box, x: 10.2345 });
+  assert.deepEqual(box, before);
+  assert.equal(normalized.label, box.label);
+  assert.equal(normalized.text, box.text);
+  assert.equal(normalized.fieldId, box.fieldId);
 });

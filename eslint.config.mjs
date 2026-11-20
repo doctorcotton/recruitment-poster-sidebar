@@ -47,7 +47,7 @@ export default tseslint.config(
       "jsx-a11y/click-events-have-key-events": "error",
       "jsx-a11y/label-has-associated-control": [
         "error",
-        { controlComponents: ["Input", "InputNumber", "Select", "TextArea"] },
+        { controlComponents: ["Input", "InputNumber", "NumberField", "Select", "TextArea"] },
       ],
     },
   },

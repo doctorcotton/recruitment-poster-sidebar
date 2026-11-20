@@ -256,7 +256,7 @@ try {
       (await page.getByLabel("配置数据表", { exact: true }).innerText()).includes("本地示例配置"),
     );
   });
-  await check("字体延迟或暂时失败时首屏记录仍可阅读，可在原页重试预览", async () => {
+  await check("完整字体延迟时先用常用字子集出图，记录与海报仍可阅读", async () => {
     const pattern = "**/fonts/NotoSansSC-Bold.woff2";
     let release;
     const held = new Promise((resolve) => {
@@ -273,13 +273,22 @@ try {
     try {
       await page.getByRole("button", { name: "查看记录", exact: true }).click();
       await page.locator(".records-preview-column").waitFor();
-      assert.ok(await page.getByRole("button", { name: "生成并写回", exact: true }).isDisabled());
       await page.locator(".record-row.selected").filter({ hasText: "门店伙伴" }).waitFor();
+      // 海报不等完整字体：常用字子集已经能排版出图。
+      await page.locator("canvas.readonly-poster-canvas").waitFor({ state: "visible" });
     } finally {
       release();
     }
-    await page.getByRole("button", { name: "重新加载海报模板", exact: true }).click();
-    await page.locator("canvas.readonly-poster-canvas").waitFor();
+    // 失败不影响已出的画面；隔 2 秒自动再拉一次完整字体。
+    for (let attempt = 0; attempt < 40; attempt++) {
+      if (requests.filter((url) => url.includes("NotoSansSC-Bold.woff2")).length >= 2) break;
+      await page.waitForTimeout(250);
+    }
+    await page.locator(".record-row").filter({ hasText: "设计助理" }).click();
+    await page.locator(".record-row.selected").filter({ hasText: "设计助理" }).waitFor();
+    await page.locator("canvas.readonly-poster-canvas").waitFor({ state: "visible" });
+    await page.locator(".record-row").filter({ hasText: "门店伙伴" }).click();
+    await page.locator(".record-row.selected").filter({ hasText: "门店伙伴" }).waitFor();
     await waitForDraw();
   });
   await check("分别选择业务表和已有配置表，确认后显示配置状态", async () => {
@@ -295,11 +304,16 @@ try {
     const fontRequests = requests.filter((url) =>
       /\.(?:woff2?|otf|ttf)$/i.test(new URL(url).pathname),
     );
-    assert.equal(fontRequests.length, 2);
-    assert.deepEqual(
-      [...new Set(fontRequests)],
-      [new URL("fonts/NotoSansSC-Bold.woff2", baseUrl).href],
+    // 只接受 WOFF2：完整字体被拦截后重试一次，常用字子集照常只下一次。
+    assert.ok(fontRequests.every((url) => /\.woff2$/i.test(new URL(url).pathname)));
+    const fullFont = fontRequests.filter(
+      (url) => new URL(url).pathname === new URL("fonts/NotoSansSC-Bold.woff2", baseUrl).pathname,
     );
+    assert.equal(fullFont.length, 2);
+    const subset = fontRequests.filter((url) =>
+      new URL(url).pathname.endsWith("NotoSansSC-Bold-common.woff2"),
+    );
+    assert.equal(subset.length, 1);
   });
   await check("默认首屏只有记录列表和只读海报，不暴露高级编辑", async () => {
     await page.getByRole("heading", { name: "本地示例 · 门店伙伴", exact: true }).first().waitFor();
@@ -395,10 +409,15 @@ try {
   await check("高级编辑载入默认底图与六个文字框", async () => {
     await openAdvancedEditor();
     assert.equal(await page.locator("[data-box-id]").count(), 6);
-    assert.deepEqual(
-      await page.locator("canvas").evaluate((canvas) => [canvas.width, canvas.height]),
-      [882, 1783],
-    );
+    // 编辑区预览位图按画板显示像素申请，不再固定超采样到模板原始尺寸。
+    const stage = page.locator(".artboard > canvas.poster-canvas");
+    const bitmap = await stage.evaluate((canvas) => [canvas.width, canvas.height]);
+    const css = await stage.evaluate((canvas) => {
+      const box = canvas.getBoundingClientRect();
+      return [box.width, box.height];
+    });
+    const dpr = await page.evaluate(() => window.devicePixelRatio);
+    bitmap.forEach((side, index) => assert.ok(Math.abs(side - css[index] * dpr) <= 1));
     assert.equal(errors.length, 0, errors.join("\n"));
   });
   await check("桌面工作台通过 axe WCAG AA 检查", async () => {
@@ -530,6 +549,27 @@ try {
     await page.getByRole("alert").filter({ hasText: "字体文件无法读取" }).waitFor();
     await closeNotice();
   });
+  await check("优设标题黑可按需选用、渲染、撤销与重做", async () => {
+    const font = page.getByLabel("字体", { exact: true });
+    const originalFont = await font.innerText();
+    const titleFontRequests = () =>
+      requests.filter((url) => url.endsWith("/YouSheBiaoTiHei.woff2"));
+    assert.equal(titleFontRequests().length, 0);
+    const facesBefore = await page.evaluate(() => document.fonts.size);
+    await font.click();
+    await page
+      .getByRole("option")
+      .filter({ hasText: /^优设标题黑$/ })
+      .click();
+    await font.getByText("优设标题黑", { exact: true }).waitFor();
+    await page.waitForFunction((before) => document.fonts.size > before, facesBefore);
+    await waitForDraw();
+    await page.getByRole("button", { name: "撤销", exact: true }).click();
+    assert.equal(await font.innerText(), originalFont);
+    await page.getByRole("button", { name: "重做", exact: true }).click();
+    await font.getByText("优设标题黑", { exact: true }).waitFor();
+    assert.equal(titleFontRequests().length, 1);
+  });
   await check("字段绑定可切换为固定文字", async () => {
     await openMapping();
     await page.locator('[data-mapping-box-id="job"]').getByLabel("岗位", { exact: true }).click();
@@ -560,6 +600,10 @@ try {
     await openRightTab("settings");
     assert.equal(await page.getByLabel("模板名称", { exact: true }).inputValue(), "本地验收模板");
     await openRightTab("properties");
+    await page
+      .getByLabel("字体", { exact: true })
+      .getByText("优设标题黑", { exact: true })
+      .waitFor();
     assert.equal(
       await page.getByLabel("固定文字内容", { exact: true }).inputValue(),
       "前端画布验证",
