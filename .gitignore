@@ -9,3 +9,10 @@ artifacts/*
 !artifacts/loading-audit.json
 output/
 .zcode/
+# 抓包文件体积大且含会话数据，不入库
+*.har
+# 市场宣传素材与说明图：本地留档，不进主仓历史
+detail-images/
+ChatGPT*.png
+recruitment-poster-logo.png
+recruitment-poster-intro-700x436.png
