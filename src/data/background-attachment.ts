@@ -63,17 +63,22 @@ export async function downloadBackground(
   fetcher: typeof fetch = fetch,
 ): Promise<PosterAsset> {
   const raw = await downloadAttachment(url, fetcher);
-  const head = new Uint8Array(await raw.slice(0, 8).arrayBuffer());
+  const head = new Uint8Array(await raw.slice(0, 12).arrayBuffer());
   const png =
     head.length >= 8 &&
     [137, 80, 78, 71, 13, 10, 26, 10].every((byte, index) => head[index] === byte);
   const jpeg = head.length >= 3 && head[0] === 255 && head[1] === 216 && head[2] === 255;
-  if (!png && !jpeg)
+  // WebP 容器：RIFF....WEBP，示例底图用它，比同画面 PNG 小一个数量级。
+  const webp =
+    head.length >= 12 &&
+    [82, 73, 70, 70].every((byte, index) => head[index] === byte) &&
+    [87, 69, 66, 80].every((byte, index) => head[index + 8] === byte);
+  if (!png && !jpeg && !webp)
     throw new PosterError(
       "INVALID_ASSET",
-      "底图附件必须是非空 PNG 或 JPEG 图片，文件内容与图片格式不符。",
+      "底图附件必须是非空 PNG、JPEG 或 WebP 图片，文件内容与图片格式不符。",
     );
-  const mimeType = png ? "image/png" : "image/jpeg";
+  const mimeType = png ? "image/png" : jpeg ? "image/jpeg" : "image/webp";
   const blob = raw.slice(0, raw.size, mimeType);
   // 标识只由图片字节生成；返回值和缓存均不携带附件 token 或临时 URL。
   return { id: `asset-${await hashBlob(blob)}`, name, mimeType, blob };

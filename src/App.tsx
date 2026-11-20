@@ -28,10 +28,6 @@ import {
   withPresetFonts,
   loadDefaultBundle,
   prefetchPresetFont,
-  hasPresetFontSubset,
-  promotePresetFont,
-  withCompletePresetFont,
-  loadPresetFontUpgrade,
   loadTitlePresetFont,
 } from "./data/preset-fonts";
 import { withSourceBackground } from "./application/source-background";
@@ -380,29 +376,6 @@ export default function App() {
   };
 
   useEffect(() => observeSemiA11y(), []);
-
-  // 首屏先用常用字子集出图；完整字体到货后替换素材，画布随之重绘一次。
-  useEffect(() => {
-    if (!hasPresetFontSubset(assets)) return;
-    let disposed = false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const upgrade = (attemptsLeft: number) => {
-      void loadPresetFontUpgrade()
-        .then((full) => {
-          if (!disposed) setAssets((current) => promotePresetFont(current, full));
-        })
-        .catch(() => {
-          // 完整字体失败时画面停在子集上；隔一会儿自动再试一次，不让用户手动刷。
-          if (disposed || attemptsLeft <= 0) return;
-          timer = setTimeout(() => upgrade(attemptsLeft - 1), 2000);
-        });
-    };
-    upgrade(1);
-    return () => {
-      disposed = true;
-      clearTimeout(timer);
-    };
-  }, [assets]);
 
   // 模板列表统一两个数据源：启用模板表时列模板行，否则列本地/独立模板库。
   const templateListRows = useMemo<TemplateRowSummary[]>(
@@ -1014,8 +987,8 @@ export default function App() {
   async function save(): Promise<boolean> {
     if (!bundle) return false;
     return await run("save", async () => {
-      // 子集字体只用于预览：落库前必须换成完整字体，否则以后打开只剩常用字。
-      const savedBundle = await withCompletePresetFont(bundle);
+      // 内置字体只有一份常用字子集字节，预览、保存、导出完全一致。
+      const savedBundle = bundle;
       if (templateFieldId) {
         if (!templateBackgroundFieldId)
           throw new Error("请先在「设置」里选择模板底图字段，再保存模板");
@@ -1279,7 +1252,7 @@ export default function App() {
     await run("export-template", async () => {
       const { createTemplatePackage } = await import("./application/template-package");
       // 导出的模板包要带完整字体，不能把预览子集发给别人。
-      const packed = await createTemplatePackage(await withCompletePresetFont(bundle));
+      const packed = await createTemplatePackage(bundle);
       downloadBlob(packed, `${safeFilename(bundle.template.name)}.poster.zip`);
       setNotice({ kind: "success", text: "模板包已导出，包含声明 JSON 和原始素材" });
     });
@@ -1324,7 +1297,7 @@ export default function App() {
       if (templateFieldId && !record) throw new Error("请先选择一条记录");
       if (!stageBundle) throw new Error("海报还没有可用的底图");
       // PNG 必须用完整字体：预览可能还停在常用字子集上。
-      const blob = await renderer.png(await withCompletePresetFont(stageBundle), values);
+      const blob = await renderer.png(stageBundle, values);
       if (download) downloadBlob(blob, `${safeFilename(template!.name)}.png`);
       else setPreview({ url: URL.createObjectURL(blob), blob });
     });
@@ -1386,7 +1359,7 @@ export default function App() {
             return saved;
           },
           // 逐行渲染同样要完整字体，避免写回的海报只有常用字。
-          resolveBundle: async (_row, rowTemplate) => withCompletePresetFont(rowTemplate),
+          resolveBundle: async (_row, rowTemplate) => rowTemplate,
           readOutputVersion: (row) =>
             repository.readOutputVersion(row.id, targetFieldId, taskContext.tableId),
           render: (row, resolved, signal) =>

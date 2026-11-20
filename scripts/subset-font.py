@@ -1,11 +1,11 @@
-"""生成内置字体的常用字子集（首屏先出图，完整字体随后替换）。
+"""生成内置字体的常用字子集（插件只随仓库带这一份字体）。
 
 依赖：pip install fonttools brotli
-用法：python3 scripts/subset-font.py public/fonts/NotoSansSC-Bold.woff2 public/fonts/NotoSansSC-Bold-common.woff2
+用法：python3 scripts/subset-font.py <全字库 woff2> public/fonts/NotoSansSC-Bold-common.woff2
 
+全字库不再入库，需要重新生成时先从字体官方渠道取回 NotoSansSC-Bold 的 woff2 再执行。
 子集 = ASCII + Latin-1 + 常用标点 + 全角符号 + GB2312 全部汉字。
-子集缺字不会显示空白方块：画布字体串带 sans-serif 兜底，缺字由系统字体渲染，
-完整字体到货后自动重绘一次，最终效果与全字符集一致。
+子集缺字不会显示空白方块：画布字体串带 sans-serif 兜底，缺字由系统字体渲染。
 """
 
 import sys

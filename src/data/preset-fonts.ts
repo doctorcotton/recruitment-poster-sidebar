@@ -5,9 +5,10 @@ import { downloadAttachment } from "./background-attachment";
 
 export const PRESET_FONT = {
   id: "noto-bold",
+  /** 素材名沿用完整字体的文件名，已保存模板的配置不需要迁移。 */
   name: "NotoSansSC-Bold.woff2",
-  /** 常用字子集：首屏先用它出图，完整字体到货后替换。 */
-  fastName: "NotoSansSC-Bold-common.woff2",
+  /** 实际加载的是 GB2312 常用字子集，完整字库不进仓库。 */
+  file: "NotoSansSC-Bold-common.woff2",
   label: "Noto Sans SC · 粗体",
 };
 
@@ -22,12 +23,12 @@ export type PresetFontKey = "noto-bold-v1" | "youshe-title-v1";
 
 type FontFingerprint = { mimeType: string; size: number; hash: string };
 
-// 引用键对应固定的完整字体字节，替换文件时应使用新的版本键。
+// 引用键对应固定的内置字体字节，替换文件时应使用新的版本键。
 const presetFingerprints: Record<PresetFontKey, FontFingerprint> = {
   "noto-bold-v1": {
     mimeType: "font/woff2",
-    size: 6415836,
-    hash: "cfcf82f16c4b07bdab00a54a9b87e35d3954d4e0321ab3495a252718145873ba",
+    size: 1488080,
+    hash: "03baa381bb5225fda99d1f25a813832569792787b83d1d12348d273859e025a5",
   },
   "youshe-title-v1": {
     mimeType: "font/woff2",
@@ -37,13 +38,8 @@ const presetFingerprints: Record<PresetFontKey, FontFingerprint> = {
 };
 
 let presetFont: Promise<PosterAsset> | undefined;
-let presetFastFont: Promise<PosterAsset> | undefined;
 let titleFont: Promise<PosterAsset> | undefined;
 const verifiedFonts = new Map<PresetFontKey, Promise<Blob>>();
-/** 已解析的完整字体；同一页面内再次加载时直接用它，不再退回子集。 */
-let fullAsset: PosterAsset | undefined;
-/** 子集字节的引用：用来识别画布上仍是预览字体。 */
-let fastBlob: Blob | undefined;
 
 /** 静态资源前缀：Vite 注入 BASE_URL，单元测试里退回根路径。 */
 function assetUrl(path: string): string {
@@ -53,7 +49,7 @@ function assetUrl(path: string): string {
 
 async function fetchFontAsset(
   preset: Pick<PosterAsset, "id" | "name">,
-  file = preset.name,
+  file: string,
 ): Promise<PosterAsset> {
   try {
     const mimeType = "font/woff2";
@@ -70,7 +66,7 @@ async function fetchFontAsset(
   throw new PosterError("FONT_LOAD_FAILED", `内置字体“${preset.name}”加载失败，请重试`);
 }
 
-/** 选用时才加载完整字体，重复选用复用请求。 */
+/** 选用时才加载优设标题黑，重复选用复用请求。 */
 export function loadTitlePresetFont(): Promise<PosterAsset> {
   titleFont ??= fetchFontAsset(TITLE_PRESET_FONT, TITLE_PRESET_FONT.file).catch((error) => {
     titleFont = undefined;
@@ -79,21 +75,19 @@ export function loadTitlePresetFont(): Promise<PosterAsset> {
   return titleFont;
 }
 
-/** 完整字体（全字符集 6.4 MB）：最终排版、保存和导出都用它。 */
-function loadFullFont(): Promise<PosterAsset> {
-  presetFont ??= fetchFontAsset(PRESET_FONT)
-    .then((asset) => {
-      fullAsset = asset;
-      return asset;
-    })
-    .catch((error) => {
-      presetFont = undefined;
-      throw error;
-    });
+/**
+ * 内置 Noto 字体（GB2312 常用字子集）：排版、保存、导出都用同一份字节。
+ * 子集之外的生僻字由画布字体串的 sans-serif 兜底，不会显示空白方块。
+ */
+function loadPresetFont(): Promise<PosterAsset> {
+  presetFont ??= fetchFontAsset(PRESET_FONT, PRESET_FONT.file).catch((error) => {
+    presetFont = undefined;
+    throw error;
+  });
   return presetFont;
 }
 
-/** 按完整字体内容识别，素材名和 ID 可随模板变化。 */
+/** 按字体内容识别，素材名和 ID 可随模板变化。 */
 export function identifyPresetFont(asset: FontFingerprint): PresetFontKey | undefined {
   for (const [key, preset] of Object.entries(presetFingerprints)) {
     if (
@@ -107,7 +101,7 @@ export function identifyPresetFont(asset: FontFingerprint): PresetFontKey | unde
 
 async function verifyReferencedFont(key: PresetFontKey): Promise<Blob> {
   const isNoto = key === "noto-bold-v1";
-  const { name, blob } = await (isNoto ? loadFullFont() : loadTitlePresetFont());
+  const { name, blob } = await (isNoto ? loadPresetFont() : loadTitlePresetFont());
   const { size, hash } = presetFingerprints[key];
   try {
     if (blob.size === size && (await hashBlob(blob)) === hash) return blob;
@@ -115,12 +109,8 @@ async function verifyReferencedFont(key: PresetFontKey): Promise<Blob> {
     // 读取字体字节失败也按内置字体加载失败处理。
   }
   // 清除未通过校验的静态资源缓存，允许后续重试。
-  if (isNoto) {
-    presetFont = undefined;
-    fullAsset = undefined;
-  } else {
-    titleFont = undefined;
-  }
+  if (isNoto) presetFont = undefined;
+  else titleFont = undefined;
   throw new PosterError("FONT_LOAD_FAILED", `内置字体“${name}”校验失败，请重试`);
 }
 
@@ -136,7 +126,7 @@ export function loadReferencedPresetFont(key: PresetFontKey): Promise<Blob> {
   return verified;
 }
 
-/** 只有完整内置字体的字节与保存清单一致时，才能替代飞书附件。 */
+/** 只有内置字体的字节与保存清单一致时，才能替代飞书附件。 */
 export async function reuseSavedPresetFont(asset: FontFingerprint): Promise<Blob | undefined> {
   const key = identifyPresetFont(asset);
   if (!key) return;
@@ -147,82 +137,21 @@ export async function reuseSavedPresetFont(asset: FontFingerprint): Promise<Blob
   }
 }
 
-/**
- * 常用字子集（约 1.4 MB）：排版度量与完整字体同源，先用它把首屏画出来。
- * 子集缺字由画布字体串的 sans-serif 兜底，不会显示空白方块。
- */
-function loadFastFont(): Promise<PosterAsset> {
-  presetFastFont ??= fetchFontAsset(PRESET_FONT, PRESET_FONT.fastName)
-    .then((asset) => {
-      fastBlob = asset.blob;
-      return asset;
-    })
-    .catch((error) => {
-      presetFastFont = undefined;
-      throw error;
-    });
-  return presetFastFont;
-}
-
-/** 建 bundle 时用：完整字体已到货就用完整字体，否则先用子集，到货后再替换。 */
-function loadPresetAsset(): Promise<PosterAsset> {
-  return fullAsset ? Promise.resolve(fullAsset) : loadFastFont().catch(loadFullFont);
-}
-
 /** 首屏就要用它排版：启动即发请求，与工作区配置读取并行，不排进后面的串行往返。 */
 export function prefetchPresetFont(): void {
-  // 完整字体由实际出图的工作区升级，避免在模板附件还没到时抢带宽。
-  if (!fullAsset) void loadFastFont().catch(() => {});
+  void loadPresetFont().catch(() => {});
 }
 
-function presetFontSubsetIndex(assets: PosterAsset[]): number {
-  return fastBlob
-    ? assets.findIndex((asset) => asset.id === PRESET_FONT.id && asset.blob === fastBlob)
-    : -1;
-}
-
-export function hasPresetFontSubset(assets: PosterAsset[]): boolean {
-  return presetFontSubsetIndex(assets) >= 0;
-}
-
-/**
- * 完整字体到货后把预览用的子集素材换掉；无需替换时返回原数组，避免多余重绘。
- * 画布因为 bundle 变化自动重绘一次，最终排版与全字符集完全一致。
- */
-export function promotePresetFont(assets: PosterAsset[], full: PosterAsset): PosterAsset[] {
-  const index = presetFontSubsetIndex(assets);
-  if (index < 0) return assets;
-  const next = [...assets];
-  next[index] = { ...full, name: assets[index].name };
-  return next;
-}
-
-/** 写回、导出、保存前调用：把预览用的子集字体换成完整字体。 */
-export async function withCompletePresetFont(bundle: TemplateBundle): Promise<TemplateBundle> {
-  if (!hasPresetFontSubset(bundle.assets)) return bundle;
-  const full = await loadFullFont();
-  const assets = promotePresetFont(bundle.assets, full);
-  return assets === bundle.assets ? bundle : { ...bundle, assets };
-}
-
-export async function loadPresetFontUpgrade(): Promise<PosterAsset> {
-  return loadFullFont();
-}
 async function fetchDemoBackground(): Promise<{ blob: Blob; name: string }> {
-  // 优先下载体积更小的 WebP，下载失败或文件为空时回退 PNG。
-  for (const candidate of [
-    { file: "clean-background.webp", mimeType: "image/webp" },
-    { file: "clean-background.png", mimeType: "image/png" },
-  ]) {
-    try {
-      const response = await fetch(assetUrl(`demo/${candidate.file}`));
-      if (!response.ok) continue;
+  const file = "clean-background.webp";
+  try {
+    const response = await fetch(assetUrl(`demo/${file}`));
+    if (response.ok) {
       const blob = await response.blob();
-      if (blob.size)
-        return { blob: blob.slice(0, blob.size, candidate.mimeType), name: candidate.file };
-    } catch {
-      // 继续尝试下一个候选格式，失败原因由整体加载兜底。
+      if (blob.size) return { blob: blob.slice(0, blob.size, "image/webp"), name: file };
     }
+  } catch {
+    // 统一走下面的整体失败提示。
   }
   throw new Error("示例底图加载失败");
 }
@@ -241,7 +170,7 @@ export async function loadDefaultBundle(
       blob: demo.blob,
     };
   };
-  const [background, font] = await Promise.all([loadBackground(), loadPresetAsset()]);
+  const [background, font] = await Promise.all([loadBackground(), loadPresetFont()]);
   const template = structuredClone(DEFAULT_TEMPLATE);
   template.backgroundId = background.id;
   return { template, assets: [background, font] };
@@ -251,8 +180,7 @@ export async function loadDefaultBundle(
 export async function withPresetFonts(bundle: TemplateBundle): Promise<TemplateBundle> {
   let assets = bundle.assets;
   if (!assets.some((asset) => asset.id === PRESET_FONT.id)) {
-    // 完整字体已到货就直接用；否则先用子集出图，到货后由 promotePresetFont 替换。
-    assets = [...assets, await loadPresetAsset()];
+    assets = [...assets, await loadPresetFont()];
   }
   return {
     ...bundle,

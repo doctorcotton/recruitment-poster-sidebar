@@ -256,34 +256,11 @@ try {
       (await page.getByLabel("配置数据表", { exact: true }).innerText()).includes("本地示例配置"),
     );
   });
-  await check("完整字体延迟时先用常用字子集出图，记录与海报仍可阅读", async () => {
-    const pattern = "**/fonts/NotoSansSC-Bold.woff2";
-    let release;
-    const held = new Promise((resolve) => {
-      release = resolve;
-    });
-    await page.route(
-      pattern,
-      async (route) => {
-        await held;
-        await route.fulfill({ status: 503, body: "unavailable" });
-      },
-      { times: 1 },
-    );
-    try {
-      await page.getByRole("button", { name: "查看记录", exact: true }).click();
-      await page.locator(".records-preview-column").waitFor();
-      await page.locator(".record-row.selected").filter({ hasText: "门店伙伴" }).waitFor();
-      // 海报不等完整字体：常用字子集已经能排版出图。
-      await page.locator("canvas.readonly-poster-canvas").waitFor({ state: "visible" });
-    } finally {
-      release();
-    }
-    // 失败不影响已出的画面；隔 2 秒自动再拉一次完整字体。
-    for (let attempt = 0; attempt < 40; attempt++) {
-      if (requests.filter((url) => url.includes("NotoSansSC-Bold.woff2")).length >= 2) break;
-      await page.waitForTimeout(250);
-    }
+  await check("查看记录后列表与海报都可阅读，切换记录重新出图", async () => {
+    await page.getByRole("button", { name: "查看记录", exact: true }).click();
+    await page.locator(".records-preview-column").waitFor();
+    await page.locator(".record-row.selected").filter({ hasText: "门店伙伴" }).waitFor();
+    await page.locator("canvas.readonly-poster-canvas").waitFor({ state: "visible" });
     await page.locator(".record-row").filter({ hasText: "设计助理" }).click();
     await page.locator(".record-row.selected").filter({ hasText: "设计助理" }).waitFor();
     await page.locator("canvas.readonly-poster-canvas").waitFor({ state: "visible" });
@@ -304,16 +281,12 @@ try {
     const fontRequests = requests.filter((url) =>
       /\.(?:woff2?|otf|ttf)$/i.test(new URL(url).pathname),
     );
-    // 只接受 WOFF2：完整字体被拦截后重试一次，常用字子集照常只下一次。
+    // 内置字体只有一份 WOFF2 子集，一次请求后复用缓存。
     assert.ok(fontRequests.every((url) => /\.woff2$/i.test(new URL(url).pathname)));
-    const fullFont = fontRequests.filter(
-      (url) => new URL(url).pathname === new URL("fonts/NotoSansSC-Bold.woff2", baseUrl).pathname,
-    );
-    assert.equal(fullFont.length, 2);
-    const subset = fontRequests.filter((url) =>
+    const preset = fontRequests.filter((url) =>
       new URL(url).pathname.endsWith("NotoSansSC-Bold-common.woff2"),
     );
-    assert.equal(subset.length, 1);
+    assert.equal(preset.length, 1);
   });
   await check("默认首屏只有记录列表和只读海报，不暴露高级编辑", async () => {
     await page.getByRole("heading", { name: "本地示例 · 门店伙伴", exact: true }).first().waitFor();
@@ -535,7 +508,9 @@ try {
     await page.getByRole("button", { name: "撤销", exact: true }).click();
   });
   await check("上传字体并在浏览器加载", async () => {
-    await page.getByLabel("上传字体文件").setInputFiles(`${root}assets/fonts/NotoSansSC-Bold.otf`);
+    await page
+      .getByLabel("上传字体文件")
+      .setInputFiles(`${root}public/fonts/YouSheBiaoTiHei.woff2`);
     await page.locator(".notice").filter({ hasText: "字体已加载" }).waitFor();
     await closeNotice();
     assert.ok(await page.evaluate(() => document.fonts.size >= 1));

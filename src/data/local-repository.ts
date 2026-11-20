@@ -167,7 +167,7 @@ function withDemoDisplayValues(record: DataRecord): DataRecord {
     displayValues: {
       ...record.values,
       poster: "",
-      [DEMO_BACKGROUND_FIELD.id]: "clean-background.png",
+      [DEMO_BACKGROUND_FIELD.id]: "clean-background.webp",
     },
   };
 }
@@ -462,8 +462,8 @@ export class LocalPosterRepository implements PosterRepository {
       return cache
         .get("demo-background", () =>
           downloadBackground(
-            "./demo/clean-background.png",
-            "clean-background.png",
+            "./demo/clean-background.webp",
+            "clean-background.webp",
             this.options.fetcher,
           ),
         )
@@ -478,8 +478,8 @@ export class LocalPosterRepository implements PosterRepository {
     return cache
       .get("demo-background", () =>
         downloadBackground(
-          "./demo/clean-background.png",
-          "clean-background.png",
+          "./demo/clean-background.webp",
+          "clean-background.webp",
           this.options.fetcher,
         ),
       )

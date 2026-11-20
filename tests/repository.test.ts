@@ -392,7 +392,7 @@ test("本地缓存 TTL 与手动刷新可重新读取其他实例保存的设置
 });
 
 test("本地逐行底图通过可注入 fetch 读取真实示例字节，失败不缓存且错误码保留", async () => {
-  const bytes = await readFile(new URL("../public/demo/clean-background.png", import.meta.url));
+  const bytes = await readFile(new URL("../public/demo/clean-background.webp", import.meta.url));
   const urls: string[] = [];
   let broken = true;
   const repo = new LocalPosterRepository({
@@ -414,13 +414,13 @@ test("本地逐行底图通过可注入 fetch 读取真实示例字节，失败�
   const second = await repo.loadBackground("demo-2", "demo-background", "local-demo");
   assert.deepEqual(new Uint8Array(await first.blob.arrayBuffer()), new Uint8Array(bytes));
   assert.equal(first.id, second.id);
-  assert.equal(first.mimeType, "image/png");
+  assert.equal(first.mimeType, "image/webp");
   first.name = "副本改名";
   assert.equal(
     (await repo.loadBackground("demo-1", "demo-background", "local-demo")).name,
-    "clean-background.png",
+    "clean-background.webp",
   );
-  assert.deepEqual(urls, Array(2).fill("./demo/clean-background.png"));
+  assert.deepEqual(urls, Array(2).fill("./demo/clean-background.webp"));
   for (const [record, field, table] of [
     ["missing", "demo-background", "local-demo"],
     ["demo-1", "poster", "local-demo"],
@@ -478,7 +478,7 @@ test("旧 IndexedDB 上下文只补入底图字段，记录、选择行、模板
 test("本地来源配置按记录隔离，重开恢复模板与字体，只保存字体并排除普通模板列表", async () => {
   const indexedDB = new IDBFactory();
   const databaseName = "source-reload";
-  const bytes = await readFile(new URL("../public/demo/clean-background.png", import.meta.url));
+  const bytes = await readFile(new URL("../public/demo/clean-background.webp", import.meta.url));
   const options = {
     indexedDB,
     databaseName,
@@ -763,7 +763,7 @@ test("本地连接指针坏值明确失败且保留原值，不生成默认绑�
 test("本地模板页列出模板行、按行构造来源并按已保存配置标记", async () => {
   const indexedDB = new IDBFactory();
   const databaseName = "template-rows";
-  const bytes = await readFile(new URL("../public/demo/clean-background.png", import.meta.url));
+  const bytes = await readFile(new URL("../public/demo/clean-background.webp", import.meta.url));
   const options = {
     indexedDB,
     databaseName,

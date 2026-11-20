@@ -38,12 +38,9 @@ const result = {
   initialCssGzipBytes: initialCss.total,
   totalJsGzipBytes: totalJs.total,
   largestJsGzipBytes: largestJs,
-  presetFontBytes: await fileBytes("dist/fonts/NotoSansSC-Bold.woff2"),
-  // 首屏实际下载的是常用字子集；完整字体随后在后台拉取并替换。
+  // 内置字体只有一份 GB2312 常用字子集字节。
   presetSubsetFontBytes: await fileBytes("dist/fonts/NotoSansSC-Bold-common.woff2"),
-  // 首屏优先下载 WebP，作为下载兜底的 PNG 单列体积。
   demoBackgroundBytes: await fileBytes("dist/demo/clean-background.webp"),
-  demoBackgroundFallbackBytes: await fileBytes("dist/demo/clean-background.png"),
   initialJsFiles,
   initialCssFiles,
   budget,
@@ -54,7 +51,6 @@ const failures = [
   ["initialCssGzipBytes", result.initialCssGzipBytes],
   ["totalJsGzipBytes", result.totalJsGzipBytes],
   ["largestJsGzipBytes", result.largestJsGzipBytes],
-  ["presetFontBytes", result.presetFontBytes],
   ["presetSubsetFontBytes", result.presetSubsetFontBytes],
   ["demoBackgroundBytes", result.demoBackgroundBytes],
 ].filter(([name, actual]) => actual > budget[name]);

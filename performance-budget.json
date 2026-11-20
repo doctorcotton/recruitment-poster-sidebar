@@ -3,7 +3,6 @@
   "initialCssGzipBytes": 32000,
   "totalJsGzipBytes": 560000,
   "largestJsGzipBytes": 310000,
-  "presetFontBytes": 6500000,
   "demoBackgroundBytes": 400000,
   "presetSubsetFontBytes": 1600000
 }
